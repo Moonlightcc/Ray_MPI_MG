@@ -350,29 +350,77 @@ def vranlc(n, x_seed, a, y):
 
     x_seed[0] = x
 
-def zran3():
+def zran3(z, grid_level, x_seed, a):
     ''' generate random right side data'''
-     
 
+    rank = comm.Get_rank()
+    Nz, Ny, Nx = z.shape
+    for i3 in range(1,(Nz-1)):
+        for i2 in range(1,(Ny-1)):
+            vranlc(Nx-2, x_seed, a, z[i3, i2, 1:(Nx-1)])
+    
+    ten_max = [(0.0, (0, 0, 0))] * 10
+    ten_min = [(100.0, (0, 0, 0))] * 10
+
+    for i3 in range(1,(Nz-1)):
+        for i2 in range(1,(Ny-1)):
+            for i1 in range(1,(Nx-1)):
+                value = z[i3, i2, i1]
+                if value > ten_max[0][0]:
+                    ten_max[0] = (value, (i3 - 1 + rank * single_process_z_range, i2, i1))
+                    ten_max.sort(key=lambda x: x[0])
+                if value < ten_min[0][0]:
+                    ten_min[0] = (value, (i3 - 1 + rank * single_process_z_range, i2, i1))
+                    ten_min.sort(key=lambda x: -x[0])
+    
+    gathered_max_arrays = comm.gather(ten_max, root=0)
+    gathered_min_arrays = comm.gather(ten_min, root=0)
+
+    if (rank == 0):
+        gathered_max_arrays = [item for sublist in gathered_max_arrays for item in sublist]
+        gathered_min_arrays = [item for sublist in gathered_min_arrays for item in sublist]
+        sorted_max = sorted(gathered_max_arrays, key=lambda x: x[0])
+        top_max_arrays = sorted_max[-10:]
+        sorted_min = sorted(gathered_min_arrays, key=lambda x: x[0])
+        top_min_arrays = sorted_min[:10]
+    else:
+        top_max_arrays = None
+        top_min_arrays = None
+
+    global_max_values = comm.bcast(top_max_arrays, root=0)
+    global_min_values = comm.bcast(top_min_arrays, root=0)
+    
+    for i3 in range(1,(Nz-1)):
+        for i2 in range(1,(Ny-1)):
+            for i1 in range(1,(Nx-1)):
+                global_index = (i3 - 1 + rank * single_process_z_range, i2, i1)
+                if (z[i3, i2, i1],global_index) in global_max_values:
+                    z[i3, i2, i1] = 1.0
+                elif (z[i3, i2, i1],global_index) in global_min_values:
+                    z[i3, i2, i1] = -1.0
+                else:
+                    z[i3, i2, i1] = 0.0
+
+    comm3(z, grid_level)
     return 
 
 def mg3P():
     ''' implement the v-cycle multigrid algorithm '''
     # TODO
     # Au = v
-    zran3() generate v
+    # zran3() generate v
     
-    max_iteration_number
-    for i in range(5):
+    # max_iteration_number
+    # for i in range(5):
         # shrink once in grid
-        residue()
-        rrprj3()
+    #     residue()
+    #     rrprj3()
     
-    psinv() get solution in the coarsest grid
-    for i in range(5):
+    # psinv() get solution in the coarsest grid
+    # for i in range(5):
         # expand rank after iteration
-        interp()
-        psinv()
+    #     interp()
+    #    psinv()
 
     return
 
@@ -414,7 +462,14 @@ def test_residue(data_z, data_y, data_x, grid_level):
     r = residue(u, test_array, a, grid_level)
     print(r.shape)
     
+def test_zran3(data_z, data_y, data_x, grid_level):
+    rank = comm.Get_rank()
+    z = np.zeros((data_z, data_y, data_x), dtype=np.float64)
+    x_seed = [314159265.0 + rank]
+    a = 5.0 ** 13
 
+    zran3(z, grid_level, x_seed, a)
+    print(f"Process {rank}:\n", z[1,:,:])
 
 def main():
     setup()
@@ -423,7 +478,8 @@ def main():
     data_z = single_process_z_range + 2
     # test_comm3(data_z, data_y, data_x, 0)
     # test_residue(data_z, data_y, data_x, 0)
-    
+    # test_zran3(data_z, data_y, data_x, 0)
+
 if __name__ == "__main__":
     main()
 
