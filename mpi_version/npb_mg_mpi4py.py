@@ -280,9 +280,80 @@ def psinv(r, u, c, grid_level):
 
     return
 
+def randlc(x,a):
+    r23 = 2.0 ** -23
+    r46 = r23 ** 2
+    t23 = 2.0 ** 23
+    t46 = t23 ** 2
+
+    # Break A into two parts: A = 2^23 * A1 + A2
+    t1 = r23 * a
+    a1 = int(t1)
+    a2 = a - t23 * a1
+
+    # Break X into two parts: X = 2^23 * X1 + X2
+    t1 = r23 * x[0]
+    x1 = int(t1)
+    x2 = x[0] - t23 * x1
+
+    # Compute Z = A1 * X2 + A2 * X1 (mod 2^23)
+    t1 = a1 * x2 + a2 * x1
+    t2 = int(r23 * t1)
+    z = t1 - t23 * t2
+
+    # Compute X = 2^23 * Z + A2 * X2 (mod 2^46)
+    t3 = t23 * z + a2 * x2
+    t4 = int(r46 * t3)
+    x[0] = t3 - t46 * t4
+
+    # Return the normalized random number
+    return r46 * x[0]
+
+def power(a,n):
+    power = [1.0]
+    nj = n
+    aj = a
+
+    while nj != 0:
+        if (nj % 2) == 1:
+            randlc(power, aj)
+        randlc([aj], aj)
+        nj = nj // 2
+
+    return power[0]
+
+def vranlc(n, x_seed, a, y):
+    r23 = 2.0 ** -23
+    r46 = r23 ** 2
+    t23 = 2.0 ** 23
+    t46 = t23 ** 2
+
+    t1 = r23 * a
+    a1 = int(t1)
+    a2 = a - t23 * a1
+    x = x_seed[0]
+
+    for i in range(n):
+        t1 = r23 * x
+        x1 = int(t1)
+        x2 = x - t23 * x1
+
+        t1 = a1 * x2 + a2 * x1
+        t2 = int(r23 * t1)
+        z = t1 - t23 * t2
+
+        t3 = t23 * z + a2 * x2
+        t4 = int(r46 * t3)
+        x = t3 - t46 * t4
+
+        y[i] = r46 * x
+
+    x_seed[0] = x
+
 def zran3():
     ''' generate random right side data'''
-    # TODO
+     
+
     return 
 
 def mg3P():
