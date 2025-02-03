@@ -20,7 +20,7 @@ local_approximate_sol = None
 local_z = None
 
 def setup():
-    global Nx, Ny, Nz, single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_approximate_sol
+    global Nx, Ny, Nz, single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_approximate_sol, local_z
 
     setup_debug = False
 
@@ -67,7 +67,7 @@ def setup():
 
 def comm3(data, grid_level):
     ''' periodic boundary. Also send the boundary data to nearby process '''
-    global Nx, Ny, Nz, single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag
+    global Nx, Ny, Nz, single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_z
 
     if process_activate_flag == False:
         return
@@ -137,7 +137,7 @@ def comm3(data, grid_level):
         
 def residue(u,v,a,grid_level):
     ''' calculate the residue: r = v - Au '''
-    global Nx, Ny, Nz, single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag
+    global Nx, Ny, Nz, single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_z
 
     if process_activate_flag == False:
         return None
@@ -169,7 +169,7 @@ def rprj3(r, grid_level):
 
         this function implements the restriction. The number of active process should be halfed after the function
     '''
-    global Nx, Ny, Nz, single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag
+    global Nx, Ny, Nz, single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_z
     if process_activate_flag == False:
         return None
 
@@ -215,7 +215,7 @@ def rprj3(r, grid_level):
 
 def interp(z,grid_level):
     ''' interpolate the grid value from coarse grid to fine grid. The function should activate some sleeping process '''
-    global Nx, Ny, Nz, single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_approximate_sol
+    global Nx, Ny, Nz, single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_approximate_sol, local_z
 
     curr_rank = comm.Get_rank()
     process_step = 2 ** grid_level
@@ -265,7 +265,7 @@ def interp(z,grid_level):
 
 def psinv(r, u, c, grid_level):
     ''' apply smoother to the data'''
-    global Nx, Ny, Nz, single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_approximate_sol
+    global Nx, Ny, Nz, single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_approximate_sol, local_z
     if process_activate_flag == False:
         return
     
@@ -352,6 +352,7 @@ def vranlc(n, x_seed, a, y):
 
 def zran3(z, grid_level, x_seed, a):
     ''' generate random right side data'''
+    global Nx, Ny, Nz, single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_approximate_sol, local_z
 
     rank = comm.Get_rank()
     Nz, Ny, Nx = z.shape
@@ -404,23 +405,26 @@ def zran3(z, grid_level, x_seed, a):
     comm3(z, grid_level)
     return 
 
-def mg3P():
+def mg3P(u,v,r,a,c):
     ''' implement the v-cycle multigrid algorithm '''
-    # TODO
-    # Au = v
-    # zran3() generate v
+    # TODO: test
+
+    global Nx, Ny, Nz, single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_approximate_sol, local_z
+
+    rank = comm.Get_rank()
+    Nz, Ny, Nx = u.shape
+    for i in range(max_grid_level):
+        rprj3(r,i)
     
-    # max_iteration_number
-    # for i in range(5):
-        # shrink once in grid
-    #     residue()
-    #     rrprj3()
-    
-    # psinv() get solution in the coarsest grid
-    # for i in range(5):
-        # expand rank after iteration
-    #     interp()
-    #    psinv()
+    psinv(r,u,c,max_grid_level)
+    for i in range(max_grid_level, 0, -1):
+        temp_u = interp(u, i)
+        temp_r = residue(u,v,a,i)
+        psinv(r,u,c,i)
+
+    temp_u = interp(u,i)
+    temp_r = residue(u,v,a,0)
+    psinv(r,u,c,0)
 
     return
 
@@ -472,10 +476,29 @@ def test_zran3(data_z, data_y, data_x, grid_level):
     print(f"Process {rank}:\n", z[1,:,:])
 
 def main():
+    global Nx, Ny, Nz, single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_approximate_sol, local_z
+    
     setup()
     data_x = Nx + 2
     data_y = Ny + 2
     data_z = single_process_z_range + 2
+
+
+    local_z = np.zeros((data_z, data_y, data_x), dtype=np.float64)
+    x_seed = [314159265.0 + rank]
+    a = 5.0 ** 13
+    zran3(local_z, 0, x_seed, a)
+    
+    a = [-8.0/3.0, 0.0, 1.0/6.0, 1.0/12.0]
+    c = [-3.0/8.0, 1.0/32.0, -1.0/64.0, 0.0]
+
+    local_approximate_sol = np.zeros_like(local_z)
+    resid = residue(local_approximate_sol, local_z, a, 0)
+    iteration_number = 20
+    for i in range(iteration_number):
+        mg3P(u,v,r,a,c)
+        temp_r = residue(local_approximate_sol, local_z, a, 0)
+
     # test_comm3(data_z, data_y, data_x, 0)
     # test_residue(data_z, data_y, data_x, 0)
     # test_zran3(data_z, data_y, data_x, 0)
