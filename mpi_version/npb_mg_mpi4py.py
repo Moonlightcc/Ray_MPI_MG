@@ -150,6 +150,14 @@ def residue(u,v,a,grid_level):
     ua3 = u2[:,:,0:(Nx-2)] + u2[:,:,2:Nx]
     
     r = np.zeros_like(u)
+    
+    '''
+    print(f"v: {type(v)}, v is None: {v is None}")
+    print(f"u: {type(u)}, u is None: {u is None}")
+    print(f"a: {type(a)}, a is None: {a is None}")
+    print(f"r: {type(r)}, r is None: {r is None}")
+    '''
+
     r[1:(Nz-1), 1:(Ny-1), 1:(Nx-1)] = v[1:(Nz-1), 1:(Ny-1), 1:(Nx-1)] - a[0] * u[1:(Nz-1), 1:(Ny-1), 1:(Nx-1)] - a[1] * ua1 - a[2] * ua2 - a[3] * ua3
 
     # for i3 in range(1,Nz-1):
@@ -181,29 +189,33 @@ def rprj3(r, grid_level):
     if index_of_active_process % 2 == 0: # even rank. Should be active after this function
         r2 = comm.recv(source = curr_rank + process_step, tag=0)
         Nz, Ny, Nx = r.shape
+        NNz = Nz
+        NNy = Ny // 2 + 1
+        NNx = Nx // 2 + 1
         rt = np.concatenate((r[:(Nz-1), :, :], r2[1:, :, :]), axis = 0)
         
-        j3 = np.arange(1, Nz-1)
-        j2 = np.arange(1, Ny-1)
-        j1 = np.arange(1, Nx) # special here
-        j0 = np.arange(1, Nx-1)
+        j3 = np.arange(1, NNz-1)
+        j2 = np.arange(1, NNy-1)
+        j1 = np.arange(1, NNx) # special here
+        j0 = np.arange(1, NNx-1)
         i3 = 2 * j3 - 1
         i2 = 2 * j2 - 1
         i1 = 2 * j1 - 1
         i0 = 2 * j0 - 1
-
-        x1 = rt[np.ix_(i3+1, i2, i1)] + rt[np.ix_(i3+1,i2+2,i1)] + rt[np.ix_(i3,i2+1,i1)] + rt[np.ix_(i3+2,i2+1,i1)]
-        y1 = rt[np.ix_(i3, i2, i1)] + rt[np.ix_(i3+2,i2,i1)] + rt[np.ix_(i3,i2+2,i1)] + rt[np.ix_(i3+2,i2+2,i1)]
+        
+        ii0 = np.arange(Nx)
+        x1 = rt[np.ix_(i3+1, i2, ii0)] + rt[np.ix_(i3+1,i2+2,ii0)] + rt[np.ix_(i3,i2+1,ii0)] + rt[np.ix_(i3+2,i2+1,ii0)]
+        y1 = rt[np.ix_(i3, i2, ii0)] + rt[np.ix_(i3+2,i2,ii0)] + rt[np.ix_(i3,i2+2,ii0)] + rt[np.ix_(i3+2,i2+2,ii0)]
 
         y2 = rt[np.ix_(i3, i2, i0+1)] + rt[np.ix_(i3+2,i2,i0+1)] + rt[np.ix_(i3,i2+2,i0+1)] + rt[np.ix_(i3+2,i2+2,i0+1)]
         x2 = rt[np.ix_(i3+1, i2, i0+1)] + rt[np.ix_(i3+1,i2+2,i0+1)] + rt[np.ix_(i3,i2+1,i0+1)] + rt[np.ix_(i3+2,i2+1,i0+1)]
         
-        t2 = rt[np.ix_(i3+1, i2+1, i0)] + rt[np.ix_(i3+1, i2+1, i0+2)] + x2
+        t2 = rt[np.ix_(i3+1, i2+1, i0)] + rt[np.ix_(i3+1, i2+1, i0+2)] + x2 
         t3 = x1[:,:,i0] + x1[:,:,i0+2] + y2
         t4 = y1[:,:,i0] + y1[:,:,i0+2]
 
-        s = np.zeros_like(r)
-        s[1:(Nz-1), 1:(Ny-1), 1:(Nx-1)] = 0.5 * (rt[np.ix_(i3+1, i2+1, i0+1)]) + 0.25 * t2 + 0.125 * t3 + 0.0625 * t4
+        s = np.zeros((NNz, NNy, NNx), dtype = r.dtype)
+        s[1:-1, 1:-1, 1:-1] = 0.5 * (rt[np.ix_(i3+1, i2+1, i0+1)]) + 0.25 * t2 + 0.125 * t3 + 0.0625 * t4
 
         comm3(s,grid_level+1)
         return s
@@ -230,7 +242,7 @@ def interp(z,grid_level):
         if grid_level == 1:
             # it means we need to update local approximate solution
             next_u = comm.recv(source = curr_rank + fine_process_step, tag=1)
-            u = np.concatenate((local_approximate_sol[:(Nz-1), :, :], r2[next_u:, :, :]), axis = 0)
+            u = np.concatenate((local_approximate_sol[:(Nz-1), :, :], next_u[1:, :, :]), axis = 0)
         else:
             u = np.zeros((2*Nz-2, 2*Ny-2,2*Nx-2))
         z1 = z[0:(Nz-1), 1:Ny, :] +  z[0:(Nz-1), 0:(Ny-1), :]
@@ -249,7 +261,7 @@ def interp(z,grid_level):
         u[np.ix_(2*i3+1, 2*i2+1, 2*i1)] = u[np.ix_(2*i3+1, 2*i2+1, 2*i1)] + 0.25 * z3[:,:,0:(Nx-1)]
         u[np.ix_(2*i3+1, 2*i2+1, 2*i1+1)] = u[np.ix_(2*i3+1, 2*i2+1, 2*i1+1)] + 0.125*(z3[:,:,0:(Nx-1)] + z3[:,:,1:Nx])
         
-        send_u = u[Nx-2, :, :]
+        send_u = u[Nx-2:, :, :]
         comm.send(send_u, dest= curr_rank + fine_process_step, tag=0)
         return u[:Nz, :, :]
     else:
@@ -415,28 +427,30 @@ def mg3P(v,r,a,c):
     Nz, Ny, Nx = r.shape
 
     for i in range(max_grid_level):
-        print(f"\nRank {rank}: ", i)
         r = rprj3(r,i)
         comm.barrier()
-    
+         
     temp_u = np.zeros_like(r)
     psinv(r,temp_u,c,max_grid_level)
+    print(f"Rank {rank}: {process_activate_flag} , r: {type(r)}, r is None: {r is None}", flush = True)
     comm.barrier()
     for i in range(max_grid_level, 1, -1):
+        print(i, flush = True)
         temp_u = interp(temp_u, i)
+        print(f"Rank {rank}: {process_activate_flag} , r: {type(r)}, r is None: {r is None}", flush = True)
         comm.barrier()
         r = residue(temp_u,r,a,i-1)
         comm.barrier()
         psinv(r,temp_u,c,i-1)
         comm.barrier()
-
+    '''
     temp_u = interp(temp_u,1)
     comm.barrier()
     r = residue(temp_u,v,a,0)
     comm.barrier()
     psinv(r,local_approximate_sol,c,0)
     comm.barrier()
-
+    '''
     return
 
 ''' test part '''
@@ -488,8 +502,8 @@ def test_zran3(data_z, data_y, data_x, grid_level):
 
 def main():
     global Nx, Ny, Nz, single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_approximate_sol, local_z
-    
     setup()
+    comm.barrier()
     data_x = Nx + 2
     data_y = Ny + 2
     data_z = single_process_z_range + 2
@@ -499,18 +513,20 @@ def main():
     x_seed = [314159265.0 + rank]
     a = 5.0 ** 13
     zran3(local_z, 0, x_seed, a)
-    
+    comm.barrier()
     a = [-8.0/3.0, 0.0, 1.0/6.0, 1.0/12.0]
     c = [-3.0/8.0, 1.0/32.0, -1.0/64.0, 0.0]
-
     local_approximate_sol = np.zeros_like(local_z)
     r = residue(local_approximate_sol, local_z, a, 0)
+    comm.barrier()
     iteration_number = 1
     for i in range(iteration_number):
         mg3P(local_z,r,a,c)
-        r = residue(local_approximate_sol, local_z, a, 0)
-    
-    print(f"Process {rank}:\n", np.sum(r[1:-1,1:-1,1:-1]**2)**(0.5))
+        print(f"Process {rank}", flush = True)
+        comm.barrier()
+        # r = residue(local_approximate_sol, local_z, a, 0)
+        comm.barrier()
+    # print(f"Process {rank}:\n", np.sum(r[1:-1,1:-1,1:-1]**2)**(0.5))
     
     # test_comm3(data_z, data_y, data_x, 0)
     # test_residue(data_z, data_y, data_x, 0)
