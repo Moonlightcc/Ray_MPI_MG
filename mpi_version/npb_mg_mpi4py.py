@@ -405,26 +405,37 @@ def zran3(z, grid_level, x_seed, a):
     comm3(z, grid_level)
     return 
 
-def mg3P(u,v,r,a,c):
+def mg3P(v,r,a,c):
     ''' implement the v-cycle multigrid algorithm '''
     # TODO: test
 
     global Nx, Ny, Nz, single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_approximate_sol, local_z
 
     rank = comm.Get_rank()
-    Nz, Ny, Nx = u.shape
-    for i in range(max_grid_level):
-        rprj3(r,i)
-    
-    psinv(r,u,c,max_grid_level)
-    for i in range(max_grid_level, 0, -1):
-        temp_u = interp(u, i)
-        temp_r = residue(u,v,a,i)
-        psinv(r,u,c,i)
+    Nz, Ny, Nx = r.shape
 
-    temp_u = interp(u,i)
-    temp_r = residue(u,v,a,0)
-    psinv(r,u,c,0)
+    for i in range(max_grid_level):
+        print(f"\nRank {rank}: ", i)
+        r = rprj3(r,i)
+        comm.barrier()
+    
+    temp_u = np.zeros_like(r)
+    psinv(r,temp_u,c,max_grid_level)
+    comm.barrier()
+    for i in range(max_grid_level, 1, -1):
+        temp_u = interp(temp_u, i)
+        comm.barrier()
+        r = residue(temp_u,r,a,i-1)
+        comm.barrier()
+        psinv(r,temp_u,c,i-1)
+        comm.barrier()
+
+    temp_u = interp(temp_u,1)
+    comm.barrier()
+    r = residue(temp_u,v,a,0)
+    comm.barrier()
+    psinv(r,local_approximate_sol,c,0)
+    comm.barrier()
 
     return
 
@@ -483,7 +494,7 @@ def main():
     data_y = Ny + 2
     data_z = single_process_z_range + 2
 
-
+    rank = comm.Get_rank()
     local_z = np.zeros((data_z, data_y, data_x), dtype=np.float64)
     x_seed = [314159265.0 + rank]
     a = 5.0 ** 13
@@ -493,12 +504,14 @@ def main():
     c = [-3.0/8.0, 1.0/32.0, -1.0/64.0, 0.0]
 
     local_approximate_sol = np.zeros_like(local_z)
-    resid = residue(local_approximate_sol, local_z, a, 0)
-    iteration_number = 20
+    r = residue(local_approximate_sol, local_z, a, 0)
+    iteration_number = 1
     for i in range(iteration_number):
-        mg3P(u,v,r,a,c)
-        temp_r = residue(local_approximate_sol, local_z, a, 0)
-
+        mg3P(local_z,r,a,c)
+        r = residue(local_approximate_sol, local_z, a, 0)
+    
+    print(f"Process {rank}:\n", np.sum(r[1:-1,1:-1,1:-1]**2)**(0.5))
+    
     # test_comm3(data_z, data_y, data_x, 0)
     # test_residue(data_z, data_y, data_x, 0)
     # test_zran3(data_z, data_y, data_x, 0)
