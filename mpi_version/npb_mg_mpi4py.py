@@ -68,7 +68,7 @@ def setup():
 
 def comm3(data, grid_level):
     ''' periodic boundary. Also send the boundary data to nearby process '''
-    global Nx, Ny, Nz, single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_z
+    global single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_z
 
     if process_activate_flag == False:
         return
@@ -138,37 +138,34 @@ def comm3(data, grid_level):
         
 def residue(u,v,a,grid_level):
     ''' calculate the residue: r = v - Au '''
-    global Nx, Ny, Nz, single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_z
+    global single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_z
 
     if process_activate_flag == False:
         return None
-    Nz, Ny, Nx = u.shape
-
+    Nz, Ny, Nx = v.shape
+    
     u1 = u[1:(Nz-1), 0:(Ny-2), :] + u[1:(Nz-1), 2:Ny, :] + u[0:(Nz-2), 1:(Ny-1), :] + u[2:Nz, 1:(Ny-1), :]
     u2 = u[0:(Nz-2), 0:(Ny-2), :] + u[0:(Nz-2), 2:Ny, :] + u[2:Nz, 0:(Ny-2), :] +u[2:Nz, 2:Ny, :]
     ua1 = u[1:(Nz-1), 1:(Ny-1), 0:(Nx-2)] + u[1:(Nz-1), 1:(Ny-1), 2:Nx] + u1[:, :, 1:(Nx-1)]
     ua2 = u2[:,:,1:(Nx-1)] + u1[:, :, 0:(Nx-2)] + u1[:, :, 2:Nx]
     ua3 = u2[:,:,0:(Nx-2)] + u2[:,:,2:Nx]
     
-    r = np.zeros_like(u)
-    
-    '''
-    print(f"v: {type(v)}, v is None: {v is None}")
-    print(f"u: {type(u)}, u is None: {u is None}")
-    print(f"a: {type(a)}, a is None: {a is None}")
-    print(f"r: {type(r)}, r is None: {r is None}")
-    '''
-
+    r = np.zeros_like(v)
     r[1:(Nz-1), 1:(Ny-1), 1:(Nx-1)] = v[1:(Nz-1), 1:(Ny-1), 1:(Nx-1)] - a[0] * u[1:(Nz-1), 1:(Ny-1), 1:(Nx-1)] - a[1] * ua1 - a[2] * ua2 - a[3] * ua3
-
-    # for i3 in range(1,Nz-1):
-    #     for i2 in range(1, Ny-1):
-    #         u1 = u[i3,i2-1,:] + u[i3,i2+1,:] + u[i3-1,i2,:] + u[i3+1,i2,:]
-    #         u2 = u[i3-1,i2-1,:] + u[i3-1,i2+1,:] + u[i3+1,i2-1,:] + u[i3+1,i2+1,:]
-    #         r[i3,i2,1:(Nz-1)] = v[i3,i2,1:(Nz-1)] - a[0] * u[i3,i2,1:(Nz-1)] - a[1] * (u[i1-1,i2,1:(Nz-1)] + u[i1+1,i2,1:(Nz-1)] + u1[1:(Nz-1)]) - a[2] * (u2[1:(Nz-1)] + u1[0:(Nz-2)] + u1[2:Nz]) - a[3] * (u2[0:(Nz-2)] + u2[2:Nz])
-
+    '''
+    r = np.zeros_like(v)
+    for i3 in range(1,Nz-1):
+        for i2 in range(1,Ny-1):
+            u1 = np.zeros((Nx))
+            u2 = np.zeros((Nx))
+            for i1 in range(Nx):
+                u1[i1] = u[i3,i2-1,i1] + u[i3,i2+1,i1] + u[i3-1,i2,i1] + u[i3+1,i2,i1]
+                u2[i1] = u[i3-1,i2-1,i1] + u[i3-1,i2+1,i1] + u[i3+1,i2-1,i1] + u[i3+1,i2+1,i1]
+            for i1 in range(1,Nx-1):
+                r[i3,i2,i1] = v[i3,i2,i1] - a[0] * u[i3,i2,i1] - a[2] * (u2[i1] + u1[i1-1] + u1[i1+1]) - a[3] * (u2[i1-1] + u2[i1+1])
+    '''
     comm3(r,grid_level)
-    return r
+    return r 
 
 def rprj3(r, grid_level):
     ''' 
@@ -178,7 +175,7 @@ def rprj3(r, grid_level):
 
         this function implements the restriction. The number of active process should be halfed after the function
     '''
-    global Nx, Ny, Nz, single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_z
+    global single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_z
     if process_activate_flag == False:
         return None
 
@@ -228,7 +225,7 @@ def rprj3(r, grid_level):
 
 def interp(z,grid_level):
     ''' interpolate the grid value from coarse grid to fine grid. The function should activate some sleeping process '''
-    global Nx, Ny, Nz, single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_approximate_sol, local_z
+    global single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_approximate_sol, local_z
 
     curr_rank = comm.Get_rank()
     process_step = 2 ** grid_level
@@ -264,7 +261,9 @@ def interp(z,grid_level):
         
         send_u = u[Nz-2:, :, :]
         comm.send(send_u, dest= curr_rank + fine_process_step, tag=0)
-        return u[:Nz, :, :]
+        ret = u[:Nz, :, :]
+        comm3(ret, grid_level - 1)
+        return ret
     else:
         # check whether current process should be activated or not
         if (curr_rank % fine_process_step == 0):
@@ -272,25 +271,28 @@ def interp(z,grid_level):
                 comm.send(local_approximate_sol, dest= curr_rank - fine_process_step, tag=1)
             process_activate_flag = True
             data = comm.recv(source = curr_rank - fine_process_step, tag=0)
+            comm3(data, grid_level - 1)
             return data
         else:
             return None
 
 def psinv(r, u, c, grid_level):
     ''' apply smoother to the data'''
-    global Nx, Ny, Nz, single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_approximate_sol, local_z
+    global single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_approximate_sol, local_z
     if process_activate_flag == False:
         return
     
+    Nz, Ny, Nx = r.shape
+
     r1 = r[1:(Nz-1),0:(Ny-2),:] + r[1:(Nz-1),2:Ny,:] + r[0:(Nz-2),1:(Ny-1),:] + r[2:Nz,1:(Ny-1),:]
     r2 = r[0:(Nz-2),0:(Ny-2),:] + r[0:(Nz-2),2:Ny,:] + r[2:Nz,0:(Ny-2),:] + r[2:Nz,2:Ny,:]
     c1 = r[1:(Nz-1),1:(Ny-1),0:(Nx-2)] + r[1:(Nz-1),1:(Ny-1),2:Nx] + r1[:,:,1:(Nx-1)]
     c2 = r2[:,:,1:(Nx-1)] + r1[:,:,0:(Nx-2)] + r1[:,:,2:Nx]
     c3 = r2[:,:,0:(Nx-2)] + r2[:,:,2:Nx]
     u[1:(Nz-1),1:(Ny-1),1:(Nx-1)] = u[1:(Nz-1),1:(Ny-1),1:(Nx-1)] + c[0] * r[1:(Nz-1),1:(Ny-1),1:(Nx-1)] + c[1] * c1 + c[2] * c2 + c[3] * c3
-
+    
     comm3(u,grid_level)
-
+    
     return
 
 def randlc(x,a):
@@ -365,7 +367,7 @@ def vranlc(n, x_seed, a, y):
 
 def zran3(z, grid_level, x_seed, a):
     ''' generate random right side data'''
-    global Nx, Ny, Nz, single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_approximate_sol, local_z
+    global single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_approximate_sol, local_z
 
     rank = comm.Get_rank()
     Nz, Ny, Nx = z.shape
@@ -420,32 +422,35 @@ def zran3(z, grid_level, x_seed, a):
 
 def mg3P(v,a,c):
     ''' implement the v-cycle multigrid algorithm '''
-    # TODO: test
 
-    global Nx, Ny, Nz, single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_approximate_sol, local_z, local_r_list
+    global single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_approximate_sol, local_z, local_r_list
 
     rank = comm.Get_rank()
-    for i in range(max_grid_level):
+    for i in range(max_grid_level-1):
         local_r_list[i+1] = rprj3(local_r_list[i],i)
         comm.barrier()
-         
-    temp_u = np.zeros_like(local_r_list[max_grid_level])
-    psinv(local_r_list[max_grid_level],temp_u,c,max_grid_level)
+    
+    temp_u = np.zeros_like(local_r_list[max_grid_level-1])
+    psinv(local_r_list[max_grid_level-1],temp_u,c,max_grid_level-1)
     comm.barrier()
-    for i in range(max_grid_level, 1, -1):
+    
+    for i in range(max_grid_level-1, 1, -1):
         temp_u = interp(temp_u, i)
         comm.barrier()
         local_r_list[i-1] = residue(temp_u,local_r_list[i-1],a,i-1)
         comm.barrier()
         psinv(local_r_list[i-1],temp_u,c,i-1)
         comm.barrier()
-    
-    temp_u = interp(temp_u,1)
+
+    local_approximate_sol = interp(temp_u,1)
     comm.barrier()
-    local_r_list[0] = residue(temp_u,v,a,0)
+    local_r_list[0] = residue(local_approximate_sol,v,a,0)
     comm.barrier()
     psinv(local_r_list[0],local_approximate_sol,c,0)
     comm.barrier()
+    # if process_activate_flag == True:
+    #     print(f"Rank {rank}")
+    #     print(local_approximate_sol[1,:,:])
     
     return
 
@@ -504,7 +509,52 @@ def get_r_norm(r):
         norm_sum = 0.0
         for data in recv_data:
             norm_sum = norm_sum + data
-        print(f"Process {rank}:\n", norm_sum)
+        print(f"Process {rank}:\n", norm_sum, flush = True)
+
+# debug part
+def sample_local_z(filename):
+    global local_z
+
+    groups = []         # To store each z-level (each a list of rows)
+    current_group = []  # To collect rows for the current z-level
+
+    with open(filename, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+
+            if set(line) == {'_'}:
+                if current_group:
+                    groups.append(current_group)
+                    current_group = []
+                continue
+
+            if line.startswith('[') and line.endswith(']'):
+                row_str = line[1:-1].strip()
+                if row_str:  # If the row is not empty
+                    row = [float(x) for x in row_str.split()]
+                else:
+                    row = []
+                current_group.append(row)
+    
+        if current_group:
+            groups.append(current_group)
+
+    arr = np.array(groups)
+    
+    rank = comm.Get_rank()
+    data_level = rank + 1
+    local_z = np.zeros((3,10,10))
+    local_z[0,:,:] = arr[data_level-1,:,:]
+    local_z[1,:,:] = arr[data_level,:,:]
+    local_z[2,:,:] = arr[data_level+1,:,:]
+    return 
+
+def show_local_z():
+    rank = comm.Get_rank()
+    print(f"Process {rank}")
+    print(local_z[1,:,:])
 
 def main():
     global Nx, Ny, Nz, single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_approximate_sol, local_z, local_r_list
@@ -518,22 +568,49 @@ def main():
     local_z = np.zeros((data_z, data_y, data_x), dtype=np.float64)
     x_seed = [314159265.0 + rank]
     a = 5.0 ** 13
+    
+    # sample_local_z('sample_z.txt')
+    # show_local_z()
+
     zran3(local_z, 0, x_seed, a)
     comm.barrier()
     a = [-8.0/3.0, 0.0, 1.0/6.0, 1.0/12.0]
-    c = [-3.0/8.0, 1.0/32.0, -1.0/64.0, 0.0]
+    iteration_number = 20
+
+    if Nx != Ny or Nx != Nz:
+        smooth_type = "U"
+    elif Nx == 32 and iteration_number == 4:
+        smooth_type = "S"
+    elif Nx == 128 and iteration_number == 4:
+        smooth_type = "W"
+    elif Nx == 256 and iteration_number == 4:
+        smooth_type = "A"
+    elif Nx == 256 and iteration_number == 20:
+        smooth_type = "B"
+    elif Nx == 512 and iteration_number == 20:
+        smooth_type = "C"
+    elif Nx == 1024 and iteration_number == 50:
+        smooth_type = "D"
+    elif Nx == 2048 and iteration_number == 50:
+        smooth_type = "E"
+    else:
+        smooth_type = "U"
+
+    if smooth_type == "A" or  smooth_type == "S" or  smooth_type == "W":
+        c = [-3.0/8.0, 1.0/32.0, -1.0/64.0, 0.0]
+    else:
+        c = [-3.0/17.0, 1.0/33.0, -1.0/61.0, 0.0]
     local_approximate_sol = np.zeros_like(local_z)
     local_r_list[0] = residue(local_approximate_sol, local_z, a, 0)
+    
     comm.barrier()
-    iteration_number = 4
     for i in range(iteration_number):
         mg3P(local_z,a,c)
         comm.barrier()
         local_r_list[0] = residue(local_approximate_sol, local_z, a, 0)
         comm.barrier()
         get_r_norm(local_r_list[0])
-
-    
+     
     # test_comm3(data_z, data_y, data_x, 0)
     # test_residue(data_z, data_y, data_x, 0)
     # test_zran3(data_z, data_y, data_x, 0)
