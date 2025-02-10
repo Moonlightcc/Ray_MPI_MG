@@ -262,7 +262,7 @@ def interp(z,grid_level):
         send_u = u[Nz-2:, :, :]
         comm.send(send_u, dest= curr_rank + fine_process_step, tag=0)
         ret = u[:Nz, :, :]
-        comm3(ret, grid_level - 1)
+        # comm3(ret, grid_level - 1)
         return ret
     else:
         # check whether current process should be activated or not
@@ -271,7 +271,7 @@ def interp(z,grid_level):
                 comm.send(local_approximate_sol, dest= curr_rank - fine_process_step, tag=1)
             process_activate_flag = True
             data = comm.recv(source = curr_rank - fine_process_step, tag=0)
-            comm3(data, grid_level - 1)
+            # comm3(data, grid_level - 1)
             return data
         else:
             return None
