@@ -111,7 +111,7 @@ class mg_actor:
         return r
 
     def rprj3(self, r, grid_level):
-        if self.process_activate_flag = False:
+        if self.process_activate_flag == False:
             return None
 
         process_step = 2 ** grid_level
@@ -120,7 +120,7 @@ class mg_actor:
         
         if index_of_active_process % 2 == 0:
             r2 = ray.get(self.MPIRuntime.recv.remote(src_rank = self.rank + process_step, dest_rank = self.rank))
-            Nz, Ny, Nz = r.shape
+            Nz, Ny, Nx = r.shape
             NNz = Nz
             NNy = Ny // 2 + 1
             NNx = Nx // 2 + 1
@@ -152,7 +152,7 @@ class mg_actor:
             return s
 
         else:
-            ray.get(self.MPIRuntime.send.remote(r, src_rank=self.rank, dest_rank=seld.rank-process_step))
+            ray.get(self.MPIRuntime.send.remote(r, src_rank=self.rank, dest_rank=self.rank-process_step))
             self.process_activate_flag = False
             return None
     
@@ -174,6 +174,11 @@ class mg_actor:
             z1 = z[0:(Nz-1), 1:Ny, :] +  z[0:(Nz-1), 0:(Ny-1), :]
             z2 = z[1:Nz, 0:(Ny-1), :] +  z[0:(Nz-1), 0:(Ny-1), :]
             z3 = z[1:Nz, 1:Ny, :] + z[1:Nz, 0:(Ny-1), :] + z1
+            
+            i3 = np.arange(0,Nz-1)
+            i2 = np.arange(0,Ny-1)
+            i1 = np.arange(0,Nx-1)
+
             u[np.ix_(2*i3, 2*i2, 2*i1)] = u[np.ix_(2*i3, 2*i2, 2*i1)] + z[np.ix_(i3, i2, i1)]
             u[np.ix_(2*i3, 2*i2, 2*i1+1)] = u[np.ix_(2*i3, 2*i2, 2*i1+1)] + 0.5*(z[np.ix_(i3, i2, i1+1)] + z[np.ix_(i3, i2, i1)])
             u[np.ix_(2*i3, 2*i2+1, 2*i1)] = u[np.ix_(2*i3, 2*i2+1, 2*i1)] + 0.5 * z1[:,:,0:(Nx-1)]
@@ -184,7 +189,7 @@ class mg_actor:
             u[np.ix_(2*i3+1, 2*i2+1, 2*i1+1)] = u[np.ix_(2*i3+1, 2*i2+1, 2*i1+1)] + 0.125*(z3[:,:,0:(Nx-1)] + z3[:,:,1:Nx])
             
             send_u = u[Nz-2:, :, :]
-            ray.get(self.MPIRuntime.send.remote(send_u, src_rank=self.rank, dest_rank=self.rank-fine_process_step))
+            ray.get(self.MPIRuntime.send.remote(send_u, src_rank=self.rank, dest_rank=self.rank+fine_process_step))
             return u[:Nz, :, :]
         else:
             if(self.rank % fine_process_step == 0):
@@ -192,11 +197,11 @@ class mg_actor:
                     ray.get(self.MPIRuntime.send.remote(self.local_approximate_sol, src_rank=self.rank, dest_rank=self.rank-fine_process_step))
                 self.process_activate_flag = True
                 data = ray.get(self.MPIRuntime.recv.remote(src_rank=self.rank-fine_process_step, dest_rank=self.rank))
-                return data
+                return data.copy()
             else:
                 return None
 
-    def psinv(self, r,u,c, grid_leve):
+    def psinv(self, r,u,c, grid_level):
         if self.process_activate_flag == False:
             return 
 
@@ -296,8 +301,8 @@ class mg_actor:
                         ten_min[0] = (value, (i3 - 1 + self.rank * self.single_process_z_range, i2, i1))
                         ten_min.sort(key=lambda x: -x[0])
 
-        gathered_max_arrays = ray.get(self.MPIRuntime.gather.remote(ten_max, root=0))
-        gathered_min_arrays = ray.get(self.MPIRuntime.gather.remote(ten_min, root=0))
+        gathered_max_arrays = ray.get(self.MPIRuntime.gather.remote(self.rank, ten_max, root_rank=0))
+        gathered_min_arrays = ray.get(self.MPIRuntime.gather.remote(self.rank, ten_min, root_rank=0))
 
         if (self.rank == 0):
             gathered_max_arrays = [item for sublist in gathered_max_arrays for item in sublist]
@@ -330,26 +335,25 @@ class mg_actor:
     def mg3P(self,v,a,c):
         for i in range(self.max_grid_level-1):
             self.local_r_list[i+1] = self.rprj3(self.local_r_list[i],i)
-            ray.get(self.MPIRuntime.barrier.remote())
+            ray.get(self.MPIRuntime.barrier.remote(self.rank))
 
         temp_u = np.zeros_like(self.local_r_list[self.max_grid_level-1])
         self.psinv(self.local_r_list[self.max_grid_level-1],temp_u,c,self.max_grid_level-1)
-        ray.get(self.MPIRuntime.barrier.remote())
-
+        ray.get(self.MPIRuntime.barrier.remote(self.rank))
         for i in range(self.max_grid_level-1, 1, -1):
             temp_u = self.interp(temp_u, i)
-            ray.get(self.MPIRuntime.barrier.remote())
+            ray.get(self.MPIRuntime.barrier.remote(self.rank))
             self.local_r_list[i-1] = self.residue(temp_u,self.local_r_list[i-1],a,i-1)
-            ray.get(self.MPIRuntime.barrier.remote())
+            ray.get(self.MPIRuntime.barrier.remote(self.rank))
             self.psinv(self.local_r_list[i-1],temp_u,c,i-1)
-            ray.get(self.MPIRuntime.barrier.remote())
+            ray.get(self.MPIRuntime.barrier.remote(self.rank))
 
         self.local_approximate_sol = self.interp(temp_u,1)
-        ray.get(self.MPIRuntime.barrier.remote())
+        ray.get(self.MPIRuntime.barrier.remote(self.rank))
         self.local_r_list[0] = self.residue(self.local_approximate_sol,v,a,0)
-        ray.get(self.MPIRuntime.barrier.remote())
+        ray.get(self.MPIRuntime.barrier.remote(self.rank))
         self.psinv(self.local_r_list[0],self.local_approximate_sol,c,0)
-        ray.get(self.MPIRuntime.barrier.remote())
+        ray.get(self.MPIRuntime.barrier.remote(self.rank))
 
         return
 
@@ -373,16 +377,16 @@ class mg_actor:
 
     def get_r_norm(self,r):
         r_norm = np.sum(r[1:-1,1:-1,1:-1]**2)**(0.5)
-        ray.get(self.MPIRuntime.gather.remote(r_norm,root=0))
+        recv_data = ray.get(self.MPIRuntime.gather.remote(self.rank, r_norm, 0))
         if self.rank == 0:
             norm_sum = 0.0
             for data in recv_data:
                 norm_sum = norm_sum + data
-            print(f"Process {rank}:\n", norm_sum, flush = True)
+            print(f"Process {self.rank}:\n", norm_sum, flush = True)
 
     def eval(self):
         self.setup()
-        ray.get(self.MPIRuntime.barrier.remote())
+        ray.get(self.MPIRuntime.barrier.remote(self.rank))
         data_x = self.Nx + 2
         data_y = self.Ny + 2
         data_z = self.single_process_z_range + 2
@@ -392,7 +396,7 @@ class mg_actor:
         a = 5.0 ** 13
         
         self.zran3(self.local_z, 0, x_seed, a)
-        ray.get(self.MPIRuntime.barrier.remote())
+        ray.get(self.MPIRuntime.barrier.remote(self.rank))
         a = [-8.0/3.0, 0.0, 1.0/6.0, 1.0/12.0]
         
         if self.Nx != self.Ny or self.Nx != self.Nz:
@@ -421,13 +425,13 @@ class mg_actor:
         
         self.local_approximate_sol = np.zeros_like(self.local_z)
         self.local_r_list[0] = self.residue(self.local_approximate_sol, self.local_z, a, 0)
-        ray.get(self.MPIRuntime.barrier.remote())
-        
+        ray.get(self.MPIRuntime.barrier.remote(self.rank))
+
         for i in range(self.iteration_number):
             self.mg3P(self.local_z,a,c)
-            ray.get(self.MPIRuntime.barrier.remote())
+            ray.get(self.MPIRuntime.barrier.remote(self.rank))
             self.local_r_list[0] = self.residue(self.local_approximate_sol, self.local_z, a, 0)
-            ray.get(self.MPIRuntime.barrier.remote())
+            ray.get(self.MPIRuntime.barrier.remote(self.rank))
             self.get_r_norm(self.local_r_list[0])
         # self.test_comm3(data_z, data_y, data_x, 0)
 
@@ -438,7 +442,7 @@ def main():
     
     grid_size = args.gridsize
     single_process_z_range = args.initrange
-    nit = args.nit
+    nit = args.itn
     if (grid_size % single_process_z_range != 0):
         print("Grid Size in Z direction must be multiple of the initial range of z axis per process")
         sys.exit(1)

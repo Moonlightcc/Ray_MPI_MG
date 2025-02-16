@@ -272,7 +272,7 @@ def interp(z,grid_level):
             process_activate_flag = True
             data = comm.recv(source = curr_rank - fine_process_step, tag=0)
             # comm3(data, grid_level - 1)
-            return data
+            return data.copy()
         else:
             return None
 
@@ -575,7 +575,7 @@ def main():
     zran3(local_z, 0, x_seed, a)
     comm.barrier()
     a = [-8.0/3.0, 0.0, 1.0/6.0, 1.0/12.0]
-    iteration_number = 20
+    iteration_number = get_parser().parse_args().itn
 
     if Nx != Ny or Nx != Nz:
         smooth_type = "U"

@@ -195,4 +195,33 @@ class RayMPIRuntime:
         self.collective_buffer[my_rank] = None
 
         return final_result
-    
+
+    async def barrier(self, my_rank):
+        """
+        Synchronizes all processes to ensure that all reach this point before proceeding.
+        """
+        # Each process waits for all other processes to reach the barrier
+        await self.collective_signals.wait(self.world_size)
+
+    async def gather(self, my_rank, local_data, root_rank: int):
+        """
+        Gathers data from all processes and distributes the full dataset to all processes.
+        Ensures two synchronizations to avoid overwriting data between consecutive operations.
+        """
+
+        # Each process places its local data in the collective buffer
+        self.collective_buffer[my_rank] = local_data
+
+        # First synchronization: Ensure all processes have placed their data
+        await self.collective_signals.wait(self.world_size)
+
+        if my_rank == root_rank:
+            # Root process gathers data from all other processes
+            gathered_data = [self.collective_buffer[src_rank] for src_rank in range(self.world_size)]
+        else:
+            gathered_data = None
+
+        await self.collective_signals.wait(self.world_size)
+        self.collective_buffer[my_rank] = None
+
+        return gathered_data
