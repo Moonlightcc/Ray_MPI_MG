@@ -4,6 +4,7 @@ import ray
 import ray_mpi
 import math
 import time
+import copy
 import asyncio
 from ray.autoscaler._private.cli_logger import cli_logger
 
@@ -27,6 +28,7 @@ c
 
 finish_down
 current_level
+new_create_in_large_expand, ncile
 '''
 
 @ray.remote
@@ -58,6 +60,8 @@ class mg_actor:
         self.process_activate_flag = True
         self.finish_down = self.state["finish_down"]
         self.current_level = self.state["current_level"]
+        self.ncile = self.state["ncile"]
+        self.pre_set = self.state["pre_set"]
 
     def set_rank(self, rank):
         self.rank = rank
@@ -71,6 +75,8 @@ class mg_actor:
         
         self.finish_down = False
         self.current_level = 0
+        self.ncile = False
+        self.pre_set = False
 
         if self.setup_debug == True:
             print(f"Process {self.rank}: Nx={self.Nx}, Ny={self.Ny}, Nz={self.Nz}, single_process_z_range={self.single_process_z_range}, process_activate_flag={self.process_activate_flag}, max_grid_level={self.max_grid_level}")
@@ -400,8 +406,8 @@ class mg_actor:
                 fine_process_step = (2 ** (self.current_level-1))        
                 dest_rank=self.rank+fine_process_step
                 ray.get(self.MPIRuntime.expand_rank.remote(dest_rank))
-            ray.get(self.MPIRuntime.barrier.remote(self.rank))
 
+            ray.get(self.MPIRuntime.barrier.remote(self.rank))
             temp_u = self.interp(temp_u, self.current_level)
             ray.get(self.MPIRuntime.barrier.remote(self.rank))
             self.local_r_list[self.current_level-1] = self.residue(temp_u,self.local_r_list[self.current_level-1],a,self.current_level-1)
@@ -448,6 +454,26 @@ class mg_actor:
         self.state["finish_down"] = self.finish_down
         self.state["current_level"] = self.current_level
         self.state["local_z"] = self.local_z
+        self.state["ncile"] = self.ncile
+        self.state["pre_set"] = self.pre_set
+    
+    def update_actor_from_state(self):
+        self.world_size = self.state["world_size"]
+        self.Nx = self.state["grid_size"]
+        self.Ny = self.state["grid_size"]
+        self.Nz = self.state["grid_size"]
+        self.single_process_z_range = self.state["init_range"]
+        self.iteration_number = self.state["itn"]
+        self.current_iteration = self.state["citn"]
+        self.is_initialized = self.state["init"]
+        self.max_grid_level = self.state["max_grid_level"]
+        self.local_approximate_sol = self.state["local_approximate_sol"]
+        self.local_r_list = self.state["local_r_list"]
+        self.finish_down = self.state["finish_down"]
+        self.current_level = self.state["current_level"]
+        self.local_z = self.state["local_z"]
+        self.ncile = self.state["ncile"]
+        self.pre_set = self.state["pre_set"]
 
     def shrink_rank(self):
         self.update_state()
@@ -456,11 +482,93 @@ class mg_actor:
         ray.actor.exit_actor()
     
     def remove_half_actor(self):
+        self.update_state()
+        state_info = [self.rank, self.state]
+        state_array = ray.get(self.MPIRuntime.gather.remote(self.rank, state_info, root_rank=0))
+        if self.rank == 0:
+            sorted_array = sorted(state_array, key=lambda x: x[0])
+            t_state_array = [item for _, item in sorted_array]
+        else:
+            t_state_array = None
+                
+        if(self.rank >= self.world_size // 2):
+            self.shrink_rank()
+        else:
+            time.sleep(1)
+
+        ray.get(self.MPIRuntime.barrier.remote(self.rank))
+        # update local state
+        self.world_size = self.world_size // 2
+        self.single_process_z_range = self.single_process_z_range * 2
+        self.max_grid_level -= 1
+        self.update_state()
         
+        local_state_info = ray.get(self.MPIRuntime.scatter.remote(self.rank,t_state_array,0))
+        self.local_z = np.concatenate([local_state_info[0]["local_z"][:-1, :, :], local_state_info[1]["local_z"][1:, :, :]], axis=0)
+        self.state["local_z"] = self.local_z
+        
+        self.local_approximate_sol = np.concatenate([local_state_info[0]["local_approximate_sol"][:-1, :, :], local_state_info[1]["local_approximate_sol"][1:, :, :]], axis=0)
+        self.state["local_approximate_sol"] = self.local_approximate_sol
+
+        self.local_r_list = [None] * (self.max_grid_level + 1)
+        self.local_r_list[0] = self.residue(self.local_approximate_sol, self.local_z, self.state["a"], 0)
         return
 
     def extend_twice_actor(self):
+        # new actor. Only call barrier to pass the synchronization
+        if self.ncile == True: 
+            ray.get(self.MPIRuntime.barrier.remote(self.rank))
+            self.local_r_list[0] = self.residue(self.local_approximate_sol, self.local_z, self.state["a"], 0)
+            #print(self.local_r_list[0])
+            self.ncile = False
+            return
 
+        # sanity check   
+        if self.single_process_z_range % 2 != 0:
+            print(self.rank, "The number of z slides must be the multiple of 2")
+            exit(-1) 
+
+        # update current state
+        self.world_size = 2 * self.world_size
+        self.single_process_z_range = self.single_process_z_range // 2
+        self.max_grid_level += 1
+        self.update_state()
+        new_actor_state = copy.deepcopy(self.state)
+
+        new_actor_state["local_z"] = self.local_z[self.single_process_z_range: , : , :].copy()
+        self.local_z = self.local_z[:(self.single_process_z_range+2), :, :]
+        self.state["local_z"] = self.local_z
+        new_actor_state["local_approximate_sol"] = self.local_approximate_sol[self.single_process_z_range: , : , :].copy()
+        self.local_approximate_sol = self.local_approximate_sol[:(self.single_process_z_range+2), :, :]
+        self.state["local_approximate_sol"] = self.local_approximate_sol
+        new_actor_state["local_r_list"] = [None] * (self.max_grid_level + 1)
+        self.state["local_r_list"] = [None] * (self.max_grid_level + 1)
+        gather_info = [self.rank, (self.state, new_actor_state)]
+        state_array = ray.get(self.MPIRuntime.gather.remote(self.rank, gather_info, root_rank=0)) 
+        if self.rank == 0:
+            sorted_array = sorted(state_array, key=lambda x: x[0])
+            t_state_array = [item for _, pair in sorted_array for item in pair]
+            existing_actor_states = t_state_array[:(self.world_size//2)]
+        else:
+            existing_actor_states = None
+        local_state = ray.get(self.MPIRuntime.scatter.remote(self.rank,existing_actor_states,0))
+        local_state = local_state[0]
+        self.state = local_state
+        self.update_actor_from_state()
+        # create new actors
+        if self.rank == 0:
+            t_state_array = [item for _, pair in sorted_array for item in pair]
+            new_actor_states = t_state_array[(self.world_size//2):]
+        else:
+            new_actor_states = None
+        new_actor_state = ray.get(self.MPIRuntime.scatter.remote(self.rank,new_actor_states,0))
+        new_actor_state = new_actor_state[0]
+        new_actor_state["ncile"] = True
+        new_actor_state_ref = ray.put(new_actor_state)
+        dest_rank = self.rank + self.world_size//2
+        ray.get(self.MPIRuntime.expand_rank_using_new_state.remote(dest_rank, [new_actor_state_ref]))
+        ray.get(self.MPIRuntime.barrier.remote(self.rank))
+        self.local_r_list[0] = self.residue(self.local_approximate_sol, self.local_z, self.state["a"], 0)
         return
 
     def main(self):
@@ -519,14 +627,25 @@ class mg_actor:
             self.local_z = self.state["local_z"]
             a = self.state["a"]
             c = self.state["c"]
+
+        # assume iteration_number is multiple of 5 for test
+        phase_length = self.iteration_number // 5
         while self.current_iteration < self.iteration_number:
+            if self.pre_set == False and (self.current_iteration == phase_length or self.current_iteration == 2 * phase_length):
+                self.remove_half_actor()
+            if self.pre_set == False and (self.current_iteration == 4 * phase_length or self.current_iteration == 3 * phase_length):
+                self.extend_twice_actor()
+
+            self.pre_set = True
+        
             self.mg3P(self.local_z,a,c)
             ray.get(self.MPIRuntime.barrier.remote(self.rank))
             self.local_r_list[0] = self.residue(self.local_approximate_sol, self.local_z, a, 0)
             ray.get(self.MPIRuntime.barrier.remote(self.rank))
             self.get_r_norm(self.local_r_list[0])
             ray.get(self.MPIRuntime.barrier.remote(self.rank))
-            self.current_iteration += 1
+            self.current_iteration += 1 
+            self.pre_set = False
 
 @ray.remote
 class Controller:

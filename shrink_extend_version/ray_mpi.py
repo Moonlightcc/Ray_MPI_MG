@@ -92,6 +92,14 @@ class RayMPIRuntime:
         self.world_size += 1
         self.rank_active[rank] = True
         
+    async def expand_rank_using_new_state(self, rank: int, state_ref_l):
+        if self.rank_active[rank]:
+            return
+
+        self.rank_states[rank] = state_ref_l[0]
+        await self.controller.init_rank.remote(rank, [self.rank_states[rank]])
+        self.world_size += 1
+        self.rank_active[rank] = True
 
     ########## Communications ##########
     
@@ -139,6 +147,25 @@ class RayMPIRuntime:
 
         return data
     
+    async def scatter(self, my_rank, data, root_rank: int):
+        if my_rank == root_rank:
+            chunk_size = len(data) // self.world_size
+            for dest_rank in range(self.world_size):
+                start_idx = dest_rank * chunk_size
+                end_idx = start_idx + chunk_size
+                self.collective_buffer[dest_rank] = data[start_idx:end_idx]
+            await self.collective_signals.wait(self.world_size)
+            scattered_data = self.collective_buffer[my_rank]
+            self.collective_buffer[my_rank] = None
+        else:
+            await self.collective_signals.wait(self.world_size)
+            scattered_data = self.collective_buffer[my_rank]
+            self.collective_buffer[my_rank] = None
+
+        await self.collective_signals.wait(self.world_size)
+        return scattered_data
+
+
     async def broadcast(self, my_rank, data, root_rank: int):
         """
         Broadcasts data from the root_rank to all other processes asynchronously.
