@@ -272,6 +272,9 @@ class RayMPIRuntime:
         self.reborn_flag = self.reborn_flag[:self.world_size]
         # await self.controller.post_restrict_rank_handle.remote(new_num_ranks)
     
+    async def get_target_num(self):
+        return self.target_rank
+
     async def is_reborn(self, rank):
         return self.reborn_flag[rank]
 
@@ -588,6 +591,24 @@ class RayMPIRuntime:
 
         return final_result
     
+    async def scatter(self, my_rank, data, root_rank: int):
+        if my_rank == root_rank:
+            chunk_size = len(data) // self.world_size
+            for dest_rank in range(self.world_size):
+                start_idx = dest_rank * chunk_size
+                end_idx = start_idx + chunk_size
+                self.collective_buffer[dest_rank] = data[start_idx:end_idx]
+            await self.collective_signals.wait(self.world_size)
+            scattered_data = self.collective_buffer[my_rank]
+            self.collective_buffer[my_rank] = None
+        else:
+            await self.collective_signals.wait(self.world_size)
+            scattered_data = self.collective_buffer[my_rank]
+            self.collective_buffer[my_rank] = None
+
+        await self.collective_signals.wait(self.world_size)
+        return scattered_data
+
     async def barrier(self, rank):
         """
         Synchronizes all processes to ensure that all reach this point before proceeding.

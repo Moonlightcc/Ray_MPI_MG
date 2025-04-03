@@ -6,7 +6,6 @@ import math
 import time
 import copy
 import asyncio
-from ray.autoscaler._private.cli_logger import cli_logger
 
 ray.init(address="auto", namespace="default")
 
@@ -60,9 +59,6 @@ class mg_actor:
         self.finish_down = self.state["finish_down"]
         self.current_level = self.state["current_level"]
         self.pre_set = self.state["pre_set"]
-
-    def set_rank(self, rank):
-        self.rank = rank
 
     def setup(self):
         self.max_grid_level = int(math.log2(self.world_size))
@@ -609,6 +605,7 @@ class Controller:
         self.ranks_handle = {}
         self.finished_count = 0
         self.ranks_condition = asyncio.Condition()
+        self.enable_profile = False
     
     async def setup_profile(self):
         self.enable_profile = True
