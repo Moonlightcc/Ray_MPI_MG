@@ -28,6 +28,7 @@ c
 
 finish_down
 current_level
+new_create_in_large_expand, ncile
 '''
 
 @ray.remote
@@ -59,6 +60,7 @@ class mg_actor:
         self.process_activate_flag = True
         self.finish_down = self.state["finish_down"]
         self.current_level = self.state["current_level"]
+        self.ncile = self.state["ncile"]
         self.pre_set = self.state["pre_set"]
 
     def set_rank(self, rank):
@@ -73,6 +75,7 @@ class mg_actor:
         
         self.finish_down = False
         self.current_level = 0
+        self.ncile = False
         self.pre_set = False
 
         if self.setup_debug == True:
@@ -152,7 +155,7 @@ class mg_actor:
 
         r = np.zeros_like(v)
         r[1:(Nz-1), 1:(Ny-1), 1:(Nx-1)] = v[1:(Nz-1), 1:(Ny-1), 1:(Nx-1)] - a[0] * u[1:(Nz-1), 1:(Ny-1), 1:(Nx-1)] - a[1] * ua1 - a[2] * ua2 - a[3] * ua3
-        
+
         self.comm3(r,grid_level)
 
         return r
@@ -395,6 +398,7 @@ class mg_actor:
             self.finish_down = True
             self.psinv(self.local_r_list[self.max_grid_level-1],temp_u,c,self.max_grid_level-1)
             ray.get(self.MPIRuntime.barrier.remote(self.rank))
+
         while self.current_level > 1:
         # for i in range(self.max_grid_level-1, 1, -1):
             ## need to activate the dead actors
@@ -402,6 +406,7 @@ class mg_actor:
                 fine_process_step = (2 ** (self.current_level-1))        
                 dest_rank=self.rank+fine_process_step
                 ray.get(self.MPIRuntime.expand_rank.remote(dest_rank))
+
             ray.get(self.MPIRuntime.barrier.remote(self.rank))
             temp_u = self.interp(temp_u, self.current_level)
             ray.get(self.MPIRuntime.barrier.remote(self.rank))
@@ -410,11 +415,13 @@ class mg_actor:
             self.psinv(self.local_r_list[self.current_level-1],temp_u,c,self.current_level-1)
             ray.get(self.MPIRuntime.barrier.remote(self.rank))
             self.current_level -= 1
+        
         if self.rank % (2 ** self.current_level) == 0:
             fine_process_step = 1
             dest_rank=self.rank+fine_process_step
             ray.get(self.MPIRuntime.expand_rank.remote(dest_rank))
         ray.get(self.MPIRuntime.barrier.remote(self.rank))
+
         self.local_approximate_sol = self.interp(temp_u,1)
         ray.get(self.MPIRuntime.barrier.remote(self.rank))
         self.local_r_list[0] = self.residue(self.local_approximate_sol,v,a,0)
@@ -447,6 +454,7 @@ class mg_actor:
         self.state["finish_down"] = self.finish_down
         self.state["current_level"] = self.current_level
         self.state["local_z"] = self.local_z
+        self.state["ncile"] = self.ncile
         self.state["pre_set"] = self.pre_set
     
     def update_actor_from_state(self):
@@ -464,6 +472,7 @@ class mg_actor:
         self.finish_down = self.state["finish_down"]
         self.current_level = self.state["current_level"]
         self.local_z = self.state["local_z"]
+        self.ncile = self.state["ncile"]
         self.pre_set = self.state["pre_set"]
 
     def shrink_rank(self):
@@ -472,55 +481,98 @@ class mg_actor:
         ray.get((self.MPIRuntime.shrink_rank.remote(self.rank, [state_ref])))
         ray.actor.exit_actor()
     
-    def reconfigure_rank(self):
-        should_reconfig = ray.get(self.MPIRuntime.reconfigure_test.remote(self.rank))
-        if not should_reconfig:
+    def remove_half_actor(self):
+        self.update_state()
+        state_info = [self.rank, self.state]
+        state_array = ray.get(self.MPIRuntime.gather.remote(self.rank, state_info, root_rank=0))
+        if self.rank == 0:
+            sorted_array = sorted(state_array, key=lambda x: x[0])
+            t_state_array = [item for _, item in sorted_array]
+        else:
+            t_state_array = None
+                
+        if(self.rank >= self.world_size // 2):
+            self.shrink_rank()
+        else:
+            time.sleep(1)
+
+        ray.get(self.MPIRuntime.barrier.remote(self.rank))
+        # update local state
+        self.world_size = self.world_size // 2
+        self.single_process_z_range = self.single_process_z_range * 2
+        self.max_grid_level -= 1
+        self.update_state()
+        
+        local_state_info = ray.get(self.MPIRuntime.scatter.remote(self.rank,t_state_array,0))
+        self.local_z = np.concatenate([local_state_info[0]["local_z"][:-1, :, :], local_state_info[1]["local_z"][1:, :, :]], axis=0)
+        self.state["local_z"] = self.local_z
+        
+        self.local_approximate_sol = np.concatenate([local_state_info[0]["local_approximate_sol"][:-1, :, :], local_state_info[1]["local_approximate_sol"][1:, :, :]], axis=0)
+        self.state["local_approximate_sol"] = self.local_approximate_sol
+
+        self.local_r_list = [None] * (self.max_grid_level + 1)
+        self.local_r_list[0] = self.residue(self.local_approximate_sol, self.local_z, self.state["a"], 0)
+        return
+
+    def extend_twice_actor(self):
+        # new actor. Only call barrier to pass the synchronization
+        if self.ncile == True: 
+            ray.get(self.MPIRuntime.barrier.remote(self.rank))
+            self.local_r_list[0] = self.residue(self.local_approximate_sol, self.local_z, self.state["a"], 0)
+            #print(self.local_r_list[0])
+            self.ncile = False
             return
 
-        ray.get(self.MPIRuntime.set_reconfig_start_time.remote(self.rank, time.time()))
-        self.update_state()
-        state_ref = ray.put(self.state, _owner=self.MPIRuntime)
-        state_ref = ray.get(self.MPIRuntime.reconfigure.remote(self.rank, [state_ref], self.reconfig_handler))
-        new_state = ray.get(state_ref)
-        self.state = new_state
-        self.update_actor_from_state()
-        a = self.state["a"]
-        self.local_r_list[0] = self.residue(self.local_approximate_sol, self.local_z, a, 0)
-        ray.get(self.MPIRuntime.set_reconfig_end_time.remote(self.rank, time.time()))
+        # sanity check   
+        if self.single_process_z_range % 2 != 0:
+            print(self.rank, "The number of z slides must be the multiple of 2")
+            exit(-1) 
 
-    def reconfig_handler(self, source_states, N, M):
-        if (M & (M - 1)) != 0:
-            print("target rank is not power of 2")
-            exit(-1)
-        
-        template_state = ray.get(source_states[0])
-        Nz, Ny, Nx = template_state["local_z"].shape
-        global_z_range = (Nz-2) * N + 2
-        global_z = np.zeros((global_z_range, Ny, Nx))
-        global_sol = np.zeros((global_z_range, Ny, Nx))
-        for i in range(N):
-            source_state = ray.get(source_states[i])
-            global_z[i*(Nz-2):(i*(Nz-2)+Nz), :, :] = source_state["local_z"]
-            global_sol[i*(Nz-2):(i*(Nz-2)+Nz), :, :] = source_state["local_approximate_sol"]
-        NNz = (global_z_range - 2) // M + 2
-        return_val = [None] * M 
-        max_grid_level = int(math.log2(M))
-        single_process_z_range = template_state["init_range"] * N // M
-        for i in range(M):
-            new_state = copy.deepcopy(template_state)
-            new_state["local_z"] = global_z[i*(NNz-2):(i*(NNz-2)+NNz), :, :]
-            new_state["local_approximate_sol"] = global_sol[i*(NNz-2):(i*(NNz-2)+NNz), :, :]
-            new_state["local_r_list"] = [None] * (max_grid_level+1)
-            new_state["world_size"] = M
-            new_state["init_range"] = single_process_z_range
-            new_state["max_grid_level"] = max_grid_level
-            return_val[i] = ray.put(new_state)
-        return return_val
+        # update current state
+        self.world_size = 2 * self.world_size
+        self.single_process_z_range = self.single_process_z_range // 2
+        self.max_grid_level += 1
+        self.update_state()
+        new_actor_state = copy.deepcopy(self.state)
+
+        new_actor_state["local_z"] = self.local_z[self.single_process_z_range: , : , :].copy()
+        self.local_z = self.local_z[:(self.single_process_z_range+2), :, :]
+        self.state["local_z"] = self.local_z
+        new_actor_state["local_approximate_sol"] = self.local_approximate_sol[self.single_process_z_range: , : , :].copy()
+        self.local_approximate_sol = self.local_approximate_sol[:(self.single_process_z_range+2), :, :]
+        self.state["local_approximate_sol"] = self.local_approximate_sol
+        new_actor_state["local_r_list"] = [None] * (self.max_grid_level + 1)
+        self.state["local_r_list"] = [None] * (self.max_grid_level + 1)
+        gather_info = [self.rank, (self.state, new_actor_state)]
+        state_array = ray.get(self.MPIRuntime.gather.remote(self.rank, gather_info, root_rank=0)) 
+        if self.rank == 0:
+            sorted_array = sorted(state_array, key=lambda x: x[0])
+            t_state_array = [item for _, pair in sorted_array for item in pair]
+            existing_actor_states = t_state_array[:(self.world_size//2)]
+        else:
+            existing_actor_states = None
+        local_state = ray.get(self.MPIRuntime.scatter.remote(self.rank,existing_actor_states,0))
+        local_state = local_state[0]
+        self.state = local_state
+        self.update_actor_from_state()
+        # create new actors
+        if self.rank == 0:
+            t_state_array = [item for _, pair in sorted_array for item in pair]
+            new_actor_states = t_state_array[(self.world_size//2):]
+        else:
+            new_actor_states = None
+        new_actor_state = ray.get(self.MPIRuntime.scatter.remote(self.rank,new_actor_states,0))
+        new_actor_state = new_actor_state[0]
+        new_actor_state["ncile"] = True
+        new_actor_state_ref = ray.put(new_actor_state)
+        dest_rank = self.rank + self.world_size//2
+        ray.get(self.MPIRuntime.expand_rank_using_new_state.remote(dest_rank, [new_actor_state_ref]))
+        ray.get(self.MPIRuntime.barrier.remote(self.rank))
+        self.local_r_list[0] = self.residue(self.local_approximate_sol, self.local_z, self.state["a"], 0)
+        return
 
     def main(self):
         if self.is_initialized == False:
-            if self.rank == 0:
-                ray.get(self.MPIRuntime.set_threshold.remote(10))
             self.setup()
             ray.get(self.MPIRuntime.barrier.remote(self.rank))
             data_x = self.Nx + 2
@@ -578,79 +630,46 @@ class mg_actor:
 
         # assume iteration_number is multiple of 5 for test
         phase_length = self.iteration_number // 5
-        ray.get(self.MPIRuntime.set_init_end_time.remote(self.rank, time.time()))
         while self.current_iteration < self.iteration_number:
-            is_reborn = ray.get(self.MPIRuntime.is_reborn.remote(self.rank))
-            if is_reborn == False:
-                # computation part
-                ray.get(self.MPIRuntime.set_computation_start_time.remote(self.rank, time.time()))
-                self.mg3P(self.local_z,a,c)
-                ray.get(self.MPIRuntime.barrier.remote(self.rank))
-                self.local_r_list[0] = self.residue(self.local_approximate_sol, self.local_z, a, 0)
-                ray.get(self.MPIRuntime.barrier.remote(self.rank))
-                self.get_r_norm(self.local_r_list[0])
-                ray.get(self.MPIRuntime.barrier.remote(self.rank))
-                ray.get(self.MPIRuntime.set_computation_end_time.remote(self.rank, time.time()))
+            if self.pre_set == False and (self.current_iteration == phase_length or self.current_iteration == 2 * phase_length):
+                self.remove_half_actor()
+            if self.pre_set == False and (self.current_iteration == 4 * phase_length or self.current_iteration == 3 * phase_length):
+                self.extend_twice_actor()
 
-            if self.current_iteration % phase_length == 0:
-                if self.current_iteration < self.iteration_number // 2:
-                    ray.get(self.MPIRuntime.change_ranks.remote(self.rank, self.world_size*2))
-                else:
-                    ray.get(self.MPIRuntime.change_ranks.remote(self.rank, self.world_size//2))
-            
-            self.reconfigure_rank()
+            self.pre_set = True
+        
+            self.mg3P(self.local_z,a,c)
+            ray.get(self.MPIRuntime.barrier.remote(self.rank))
+            self.local_r_list[0] = self.residue(self.local_approximate_sol, self.local_z, a, 0)
+            ray.get(self.MPIRuntime.barrier.remote(self.rank))
+            self.get_r_norm(self.local_r_list[0])
+            ray.get(self.MPIRuntime.barrier.remote(self.rank))
             self.current_iteration += 1 
-
+            self.pre_set = False
 
 @ray.remote
 class Controller:
     def __init__(self, world_size):
         self.world_size = world_size
-        self.ranks_handle = {}
-        self.finished_count = 0
-        self.ranks_condition = asyncio.Condition()
-    
-    async def setup_profile(self):
-        self.enable_profile = True
-        self.MPIRuntime = ray.get_actor("MPIRuntime")
+        self.ranks_handle = [None] * world_size
+        self.ranks_ready = [asyncio.Event() for _ in range(world_size)]
+        self.finished = False
 
-    async def create_and_run_rank(self, rank, state_ref_l):
-        if self.enable_profile == True:
-            ray.get(self.MPIRuntime.set_init_start_time.remote(rank, time.time()))
-
-        if rank in self.ranks_handle:
-            print("Rank {} already exists".format(rank))
-            return 
-
+    async def init_rank(self, rank, state_ref_l):
         rank_handle = mg_actor.options(name="rank-{}".format(rank), lifetime="detached", get_if_exists=True).remote(rank, state_ref_l)
         self.ranks_handle[rank] = rank_handle
+        self.ranks_ready[rank].set()
 
-        asyncio.create_task(self._run_rank(rank))
+    async def run_rank(self, rank):
+        while not self.finished:
+            try:
+                await self.ranks_ready[rank].wait()
+                self.ranks_ready[rank].clear()
+                await self.ranks_handle[rank].main.remote()
+                break
 
-    async def wait_all_ranks(self):
-        async with self.ranks_condition:
-            while True:
-                if self.finished_count == len(self.ranks_handle):
-                    print("All {} ranks finished".format(self.finished_count))
-                    break
-                await self.ranks_condition.wait()
-
-    async def delete_all_ranks(self):
-        for rank in self.ranks_handle:
-            print("Delete rank {}".format(rank))
-            ray.kill(self.ranks_handle[rank])
-        self.ranks_handle = {}
-
-    async def _run_rank(self, rank):
-        try:
-            await self.ranks_handle[rank].main.remote()
-            async with self.ranks_condition:
-                self.finished_count += 1
-                self.ranks_condition.notify_all()
-
-        except Exception as e:
-            self.ranks_handle.pop(rank)
-            return
+            except Exception as e:
+                continue
 
     async def delete_rank(self, rank):
          ray.kill(self.ranks_handle[rank])
@@ -674,25 +693,31 @@ def main():
     world_size = max_num_process
     controller = Controller.options(name="Controller", lifetime="detached", get_if_exists=True).remote(world_size)
     RayMPIRuntime = ray_mpi.RayMPIRuntime.options(name="MPIRuntime", lifetime="detached", get_if_exists=True).remote()
-    
-    enable_profile = True
-    ray.get(RayMPIRuntime.init.remote(world_size, enable_profile))
-    if enable_profile:
-        ray.get(controller.setup_profile.remote())
-    
+    ray.get(RayMPIRuntime.init.remote(world_size))
+
     init_rank_task = []
     for i in range(world_size):
         init_state = {"world_size":world_size, "grid_size":grid_size, "init_range":single_process_z_range, "itn":nit, "citn":0, "init":False}
         state_ref_l = ray.put(init_state)
-        init_rank_task.append(controller.create_and_run_rank.remote(i, [state_ref_l]))
+        init_rank_task.append(controller.init_rank.remote(i, [state_ref_l]))
     ray.get(init_rank_task)
-    ray.get(controller.wait_all_ranks.remote())
-    ray.get(controller.delete_all_ranks.remote())
-    
-    if enable_profile:
-        output_file = "profile.csv"
-        ray.get(RayMPIRuntime.profile_output.remote(output_file))
 
+    #ray.get([controller.init_rank.remote(i, [world_size,grid_size, single_process_z_range, nit, 0]) for i in range(world_size)])
+
+    
+    #for i in range(world_size):
+    #    single_worker = mg_actor.remote(world_size, RayMPIRuntime, grid_size, single_process_z_range, nit)
+    #    worker_list.append(single_worker)
+    #ray.get(RayMPIRuntime.init.remote(worker_list, [i for i in range(world_size)]))
+
+    #work_list = []
+    #for worker in worker_list:
+    #    work_list.append(worker.eval.remote())
+    #ray.get(work_list)
+
+    ray.get([controller.run_rank.remote(i) for i in range(world_size)])
+
+    ray.get([controller.delete_rank.remote(i) for i in range(world_size)])
     ray.kill(RayMPIRuntime)
     ray.kill(controller)
 
