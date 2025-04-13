@@ -477,6 +477,7 @@ class mg_actor:
             else:
                 self.local_layer += 1
                 self.local_r_list[i+1] = self.local_rprj3(self.local_r_list[i])
+
             ray.get(self.MPIRuntime.barrier.remote(self.rank))
 
         temp_u = np.zeros_like(self.local_r_list[self.max_grid_level-1])
@@ -486,7 +487,7 @@ class mg_actor:
             self.local_psinv(self.local_r_list[self.max_grid_level-1], temp_u, c)
         ray.get(self.MPIRuntime.barrier.remote(self.rank))
         i = self.max_grid_level-1
-
+        
         while self.local_layer > 0:
             temp_u = self.local_interp(temp_u)
             self.local_r_list[i-1] = self.local_residue(temp_u, self.local_r_list[i-1], a)
@@ -512,15 +513,16 @@ class mg_actor:
         ray.get(self.MPIRuntime.barrier.remote(self.rank))
 
         return
-
+    
     def get_r_norm(self,r):
-        r_norm = np.sum(r[1:-1,1:-1,1:-1]**2)**(0.5)
+        r_norm = np.sum(r[1:-1,1:-1,1:-1]**2)
         recv_data = ray.get(self.MPIRuntime.gather.remote(self.rank, r_norm, 0))
         if self.rank == 0:
             norm_sum = 0.0
             for data in recv_data:
                 norm_sum = norm_sum + data
-            print(f"Process {self.rank}:\n", norm_sum, flush = True)
+            norm_sum = norm_sum ** 0.5
+            print(f"Process {self.rank} :\n", norm_sum, flush = True)
 
     def eval(self):
         self.setup()

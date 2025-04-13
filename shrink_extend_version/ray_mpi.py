@@ -368,7 +368,7 @@ class RayMPIRuntime:
             
         if control_rank < 0:
             control_rank = source_rank_list[0]
-
+        
         if rank in source_rank_list and self.reborn_flag[rank] == False:
             if rank == control_rank:
                 source_state_list = [self.rank_states[i] for i in source_rank_list]

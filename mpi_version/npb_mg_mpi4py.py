@@ -580,12 +580,13 @@ def mg3P(v,a,c):
 
 def get_r_norm(r):
     rank = comm.Get_rank()
-    r_norm = np.sum(r[1:-1,1:-1,1:-1]**2)**(0.5)
+    r_norm = np.sum(r[1:-1,1:-1,1:-1]**2)
     recv_data = comm.gather(r_norm,root=0)
     if rank == 0:
         norm_sum = 0.0
         for data in recv_data:
             norm_sum = norm_sum + data
+        norm_sum = norm_sum ** 0.5
         print(f"Process {rank}:\n", norm_sum, flush = True)
 
 def sample_local_z(filename):

@@ -83,7 +83,7 @@ class Worker:
         if state_ref_l is None:
             self.state = {}
             self.phase = 0
-            N = 1024*64
+            N = 1024
             self.data = np.arange(rank*N, (rank+1)*N)
             self.world_size = 8
         else:
@@ -224,9 +224,9 @@ class Worker:
         is_reborn = ray.get(self.MPIRuntime.is_reborn.remote(self.rank))
         if is_reborn == False:
             ray.get(self.MPIRuntime.barrier.remote(self.rank))
-        while self.phase < 1000:
+        while self.phase < 10000:
             if self.rank == 0:
-                if self.phase % 100 == 0:
+                if self.phase % 1000 == 0:
                     print(f"Pass phase: {self.phase}")
                 start_time = time.time()
             is_reborn = ray.get(self.MPIRuntime.is_reborn.remote(self.rank))
@@ -242,7 +242,7 @@ class Worker:
         
         if self.rank == 0:
             print(self.reconfig_iteration)
-            centers, throughput = self.compute_throughput(self.iteration_time, window_size=20)
+            centers, throughput = self.compute_throughput(self.iteration_time, window_size=200)
             self.plot_throughput(centers, throughput, filename="my_throughput.png")
 
 

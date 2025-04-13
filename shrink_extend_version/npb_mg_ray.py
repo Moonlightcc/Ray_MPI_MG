@@ -8,27 +8,6 @@ import copy
 import asyncio
 
 ray.init(address="auto", namespace="default")
-
-'''
-State Content:
-world_size
-grid_size
-init_range
-itn
-current_iteration_number, citn
-initialized
-
-max_grid_level
-local_approximate_sol
-local_r_list
-local_z
-a
-c
-
-finish_down
-current_level
-'''
-
 @ray.remote
 class mg_actor:
     def __init__(self, rank, state_ref_l):
@@ -58,22 +37,35 @@ class mg_actor:
         self.process_activate_flag = True
         self.finish_down = self.state["finish_down"]
         self.current_level = self.state["current_level"]
-        self.pre_set = self.state["pre_set"]
+        self.current_active_process = self.state["current_active_process"]
+        self.local_layer = self.state["local_layer"]
 
     def setup(self):
-        self.max_grid_level = int(math.log2(self.world_size))
+        self.max_grid_level = int(math.log2(self.Nx))
         self.local_approximate_sol = np.zeros((self.single_process_z_range, self.Ny, self.Nx))
         self.local_r_list = [None] * (self.max_grid_level + 1)
         self.process_activate_flag = True
-        self.setup_debug = False
         
         self.finish_down = False
         self.current_level = 0
-        self.pre_set = False
+        
+        self.current_active_process = self.world_size
+        self.local_layer = 0
 
-        if self.setup_debug == True:
-            print(f"Process {self.rank}: Nx={self.Nx}, Ny={self.Ny}, Nz={self.Nz}, single_process_z_range={self.single_process_z_range}, process_activate_flag={self.process_activate_flag}, max_grid_level={self.max_grid_level}")
-    
+    def local_comm3(self,data):
+        if self.process_activate_flag == False:
+            return
+
+        Nz, Ny, Nx = data.shape
+        data[1:(Nz-1), 1:(Ny-1), Nx - 1] = data[1:(Nz-1), 1:(Ny-1), 1]
+        data[1:(Nz-1), 1:(Ny-1), 0]      = data[1:(Nz-1), 1:(Ny-1), Nx - 2]
+        data[1:(Nz-1), Ny - 1, :] = data[1:(Nz-1), 1, :]
+        data[1:(Nz-1), 0, :] = data[1:(Nz-1), Ny - 2, :]
+        data[0, :, :] = data[-2, :, :]
+        data[-1, :, :] = data[1, :, :]
+
+        return
+
     def comm3(self, data, grid_level):
         if self.process_activate_flag == False:
             return 
@@ -134,6 +126,24 @@ class mg_actor:
         data[0, :, :] = recv_buf_bottom
         data[-1, :, :] = recv_buf_top
     
+    def local_residue(self,u,v,a):
+        if self.process_activate_flag == False:
+            return None
+
+        Nz, Ny, Nx = v.shape
+        u1 = u[1:(Nz-1), 0:(Ny-2), :] + u[1:(Nz-1), 2:Ny, :] + u[0:(Nz-2), 1:(Ny-1), :] + u[2:Nz, 1:(Ny-1), :]
+        u2 = u[0:(Nz-2), 0:(Ny-2), :] + u[0:(Nz-2), 2:Ny, :] + u[2:Nz, 0:(Ny-2), :] +u[2:Nz, 2:Ny, :]
+        ua1 = u[1:(Nz-1), 1:(Ny-1), 0:(Nx-2)] + u[1:(Nz-1), 1:(Ny-1), 2:Nx] + u1[:, :, 1:(Nx-1)]
+        ua2 = u2[:,:,1:(Nx-1)] + u1[:, :, 0:(Nx-2)] + u1[:, :, 2:Nx]
+        ua3 = u2[:,:,0:(Nx-2)] + u2[:,:,2:Nx]
+
+        r = np.zeros_like(v)
+        r[1:(Nz-1), 1:(Ny-1), 1:(Nx-1)] = v[1:(Nz-1), 1:(Ny-1), 1:(Nx-1)] - a[0] * u[1:(Nz-1), 1:(Ny-1), 1:(Nx-1)] - a[1] * ua1 - a[2] * ua2 - a[3] * ua3
+
+        self.local_comm3(r)
+
+        return r
+
     def residue(self, u, v, a, grid_level):
         if self.process_activate_flag == False:
             return None
@@ -149,9 +159,46 @@ class mg_actor:
         r = np.zeros_like(v)
         r[1:(Nz-1), 1:(Ny-1), 1:(Nx-1)] = v[1:(Nz-1), 1:(Ny-1), 1:(Nx-1)] - a[0] * u[1:(Nz-1), 1:(Ny-1), 1:(Nx-1)] - a[1] * ua1 - a[2] * ua2 - a[3] * ua3
         
-        self.comm3(r,grid_level)
+        if 2**grid_level < self.world_size:
+            self.comm3(r,grid_level)
+        else:
+            self.local_comm3(r)
 
         return r
+    
+    def local_rprj3(self, r):
+        if self.process_activate_flag == False:
+            return None
+
+        Nz, Ny, Nx = r.shape
+        NNz = Nz // 2 + 1
+        NNy = Ny // 2 + 1
+        NNx = Nx // 2 + 1
+
+        s = np.zeros((NNz, NNy, NNx), dtype = r.dtype)
+
+        j3 = np.arange(1, NNz-1)
+        j2 = np.arange(1, NNy-1)
+        j1 = np.arange(1, NNx) # special here
+        j0 = np.arange(1, NNx-1)
+        i3 = 2 * j3 - 1
+        i2 = 2 * j2 - 1
+        i1 = 2 * j1 - 1
+        i0 = 2 * j0 - 1
+
+        ii0 = np.arange(Nx)
+        x1 = r[np.ix_(i3+1, i2, ii0)] + r[np.ix_(i3+1,i2+2,ii0)] + r[np.ix_(i3,i2+1,ii0)] + r[np.ix_(i3+2,i2+1,ii0)]
+        y1 = r[np.ix_(i3, i2, ii0)] + r[np.ix_(i3+2,i2,ii0)] + r[np.ix_(i3,i2+2,ii0)] + r[np.ix_(i3+2,i2+2,ii0)]
+        y2 = r[np.ix_(i3, i2, i0+1)] + r[np.ix_(i3+2,i2,i0+1)] + r[np.ix_(i3,i2+2,i0+1)] + r[np.ix_(i3+2,i2+2,i0+1)]
+        x2 = r[np.ix_(i3+1, i2, i0+1)] + r[np.ix_(i3+1,i2+2,i0+1)] + r[np.ix_(i3,i2+1,i0+1)] + r[np.ix_(i3+2,i2+1,i0+1)]
+        t2 = r[np.ix_(i3+1, i2+1, i0)] + r[np.ix_(i3+1, i2+1, i0+2)] + x2
+        t3 = x1[:,:,i0] + x1[:,:,i0+2] + y2
+        t4 = y1[:,:,i0] + y1[:,:,i0+2]
+
+        s[1:-1, 1:-1, 1:-1] = 0.5 * (r[np.ix_(i3+1, i2+1, i0+1)]) + 0.25 * t2 + 0.125 * t3 + 0.0625 * t4
+
+        self.local_comm3(s)
+        return s
 
     def rprj3(self, r, grid_level):
         if self.process_activate_flag == False:
@@ -189,15 +236,43 @@ class mg_actor:
 
             s = np.zeros((NNz, NNy, NNx), dtype = r.dtype)
             s[1:-1, 1:-1, 1:-1] = 0.5 * (rt[np.ix_(i3+1, i2+1, i0+1)]) + 0.25 * t2 + 0.125 * t3 + 0.0625 * t4
-
-            self.comm3(s,grid_level+1)
+            
+            if process_step < self.world_size // 2:
+                self.comm3(s,grid_level+1)
+            else:
+                self.local_comm3(s)
             return s
 
         else:
             ray.get(self.MPIRuntime.send.remote(r, src_rank=self.rank, dest_rank=self.rank-process_step))
             self.process_activate_flag = False
             return None
-    
+
+    def local_interp(self, z):
+        if self.process_activate_flag == False:
+            return None
+
+        Nz, Ny, Nx = z.shape
+        u = np.zeros((2*Nz-2, 2*Ny-2,2*Nx-2))
+
+        z1 = z[0:(Nz-1), 1:Ny, :] +  z[0:(Nz-1), 0:(Ny-1), :]
+        z2 = z[1:Nz, 0:(Ny-1), :] +  z[0:(Nz-1), 0:(Ny-1), :]
+        z3 = z[1:Nz, 1:Ny, :] + z[1:Nz, 0:(Ny-1), :] + z1
+
+        i3 = np.arange(0,Nz-1)
+        i2 = np.arange(0,Ny-1)
+        i1 = np.arange(0,Nx-1)
+        u[np.ix_(2*i3, 2*i2, 2*i1)] = u[np.ix_(2*i3, 2*i2, 2*i1)] + z[np.ix_(i3, i2, i1)]
+        u[np.ix_(2*i3, 2*i2, 2*i1+1)] = u[np.ix_(2*i3, 2*i2, 2*i1+1)] + 0.5*(z[np.ix_(i3, i2, i1+1)] + z[np.ix_(i3, i2, i1)])
+        u[np.ix_(2*i3, 2*i2+1, 2*i1)] = u[np.ix_(2*i3, 2*i2+1, 2*i1)] + 0.5 * z1[:,:,0:(Nx-1)]
+        u[np.ix_(2*i3, 2*i2+1, 2*i1+1)] = u[np.ix_(2*i3, 2*i2+1, 2*i1+1)] + 0.25 * (z1[:,:,0:(Nx-1)] + z1[:,:,1:Nx])
+        u[np.ix_(2*i3+1, 2*i2, 2*i1)] = u[np.ix_(2*i3+1, 2*i2, 2*i1)] + 0.5 * z2[:,:,0:(Nx-1)]
+        u[np.ix_(2*i3+1, 2*i2, 2*i1+1)] = u[np.ix_(2*i3+1, 2*i2, 2*i1+1)] + 0.25 * (z2[:,:,0:(Nx-1)] + z2[:,:,1:Nx])
+        u[np.ix_(2*i3+1, 2*i2+1, 2*i1)] = u[np.ix_(2*i3+1, 2*i2+1, 2*i1)] + 0.25 * z3[:,:,0:(Nx-1)]
+        u[np.ix_(2*i3+1, 2*i2+1, 2*i1+1)] = u[np.ix_(2*i3+1, 2*i2+1, 2*i1+1)] + 0.125*(z3[:,:,0:(Nx-1)] + z3[:,:,1:Nx])
+
+        return u
+
     def interp(self,z,grid_level):
         process_step = 2 ** grid_level
         index_of_active_process = self.rank // process_step
@@ -241,6 +316,43 @@ class mg_actor:
             return data.copy()
         else:
             return None
+    
+            return None
+
+        Nz, Ny, Nx = z.shape
+        u = np.zeros((2*Nz-2, 2*Ny-2,2*Nx-2))
+
+        z1 = z[0:(Nz-1), 1:Ny, :] +  z[0:(Nz-1), 0:(Ny-1), :]
+        z2 = z[1:Nz, 0:(Ny-1), :] +  z[0:(Nz-1), 0:(Ny-1), :]
+        z3 = z[1:Nz, 1:Ny, :] + z[1:Nz, 0:(Ny-1), :] + z1
+
+        i3 = np.arange(0,Nz-1)
+        i2 = np.arange(0,Ny-1)
+        i1 = np.arange(0,Nx-1)
+        u[np.ix_(2*i3, 2*i2, 2*i1)] = u[np.ix_(2*i3, 2*i2, 2*i1)] + z[np.ix_(i3, i2, i1)]
+        u[np.ix_(2*i3, 2*i2, 2*i1+1)] = u[np.ix_(2*i3, 2*i2, 2*i1+1)] + 0.5*(z[np.ix_(i3, i2, i1+1)] + z[np.ix_(i3, i2, i1)])
+        u[np.ix_(2*i3, 2*i2+1, 2*i1)] = u[np.ix_(2*i3, 2*i2+1, 2*i1)] + 0.5 * z1[:,:,0:(Nx-1)]
+        u[np.ix_(2*i3, 2*i2+1, 2*i1+1)] = u[np.ix_(2*i3, 2*i2+1, 2*i1+1)] + 0.25 * (z1[:,:,0:(Nx-1)] + z1[:,:,1:Nx])
+        u[np.ix_(2*i3+1, 2*i2, 2*i1)] = u[np.ix_(2*i3+1, 2*i2, 2*i1)] + 0.5 * z2[:,:,0:(Nx-1)]
+        u[np.ix_(2*i3+1, 2*i2, 2*i1+1)] = u[np.ix_(2*i3+1, 2*i2, 2*i1+1)] + 0.25 * (z2[:,:,0:(Nx-1)] + z2[:,:,1:Nx])
+        u[np.ix_(2*i3+1, 2*i2+1, 2*i1)] = u[np.ix_(2*i3+1, 2*i2+1, 2*i1)] + 0.25 * z3[:,:,0:(Nx-1)]
+        u[np.ix_(2*i3+1, 2*i2+1, 2*i1+1)] = u[np.ix_(2*i3+1, 2*i2+1, 2*i1+1)] + 0.125*(z3[:,:,0:(Nx-1)] + z3[:,:,1:Nx])
+
+        return u
+    
+    def local_psinv(self, r, u, c):
+        if self.process_activate_flag == False:
+            return
+
+        Nz, Ny, Nx = r.shape
+        r1 = r[1:(Nz-1),0:(Ny-2),:] + r[1:(Nz-1),2:Ny,:] + r[0:(Nz-2),1:(Ny-1),:] + r[2:Nz,1:(Ny-1),:]
+        r2 = r[0:(Nz-2),0:(Ny-2),:] + r[0:(Nz-2),2:Ny,:] + r[2:Nz,0:(Ny-2),:] + r[2:Nz,2:Ny,:]
+        c1 = r[1:(Nz-1),1:(Ny-1),0:(Nx-2)] + r[1:(Nz-1),1:(Ny-1),2:Nx] + r1[:,:,1:(Nx-1)]
+        c2 = r2[:,:,1:(Nx-1)] + r1[:,:,0:(Nx-2)] + r1[:,:,2:Nx]
+        c3 = r2[:,:,0:(Nx-2)] + r2[:,:,2:Nx]
+        u[1:(Nz-1),1:(Ny-1),1:(Nx-1)] = u[1:(Nz-1),1:(Ny-1),1:(Nx-1)] + c[0] * r[1:(Nz-1),1:(Ny-1),1:(Nx-1)] + c[1] * c1 + c[2] * c2 + c[3] * c3
+
+        self.local_comm3(u)
 
     def psinv(self, r,u,c, grid_level):
         if self.process_activate_flag == False:
@@ -376,7 +488,13 @@ class mg_actor:
     def mg3P(self,v,a,c):
         if self.finish_down == False:
             while self.current_level < self.max_grid_level-1:
-                self.local_r_list[self.current_level+1] = self.rprj3(self.local_r_list[self.current_level],self.current_level)
+                if self.current_active_process > 1:
+                    self.local_r_list[self.current_level+1] = self.rprj3(self.local_r_list[self.current_level],self.current_level)
+                    self.current_active_process = self.current_active_process // 2
+                else:
+                    self.local_layer += 1
+                    self.local_r_list[self.current_level+1] = self.local_rprj3(self.local_r_list[self.current_level])
+
                 self.current_level += 1
                 ray.get(self.MPIRuntime.barrier.remote(self.rank))
                 if self.process_activate_flag == False:
@@ -385,14 +503,28 @@ class mg_actor:
                 else:
                     time.sleep(1)
                 ray.get(self.MPIRuntime.barrier.remote(self.rank))
+
         max_grid_step = 2 ** (self.max_grid_level-1)
         temp_u = np.zeros_like(self.local_r_list[self.max_grid_level-1])
-        if self.rank % max_grid_step == 0: # active actor
-            self.finish_down = True
-            self.psinv(self.local_r_list[self.max_grid_level-1],temp_u,c,self.max_grid_level-1)
-            ray.get(self.MPIRuntime.barrier.remote(self.rank))
+        if self.current_active_process > 1:
+            if self.rank % max_grid_step == 0: # active actor
+                self.finish_down = True
+                self.psinv(self.local_r_list[self.max_grid_level-1],temp_u,c,self.max_grid_level-1)
+                ray.get(self.MPIRuntime.barrier.remote(self.rank))
+        else:
+            if self.rank == 0:
+                self.finish_down = True
+                self.local_psinv(self.local_r_list[self.max_grid_level-1], temp_u, c)
+
+        if self.rank == 0:
+            while self.local_layer > 0:
+                temp_u = self.local_interp(temp_u)
+                self.local_r_list[self.current_level-1] = self.local_residue(temp_u, self.local_r_list[self.current_level-1], a)
+                self.local_psinv(self.local_r_list[self.current_level-1],temp_u,c)
+                self.current_level -= 1
+                self.local_layer -= 1
+        
         while self.current_level > 1:
-        # for i in range(self.max_grid_level-1, 1, -1):
             ## need to activate the dead actors
             if self.rank % (2 ** self.current_level) == 0:
                 fine_process_step = (2 ** (self.current_level-1))        
@@ -400,34 +532,39 @@ class mg_actor:
                 ray.get(self.MPIRuntime.expand_rank.remote(dest_rank))
             ray.get(self.MPIRuntime.barrier.remote(self.rank))
             temp_u = self.interp(temp_u, self.current_level)
+            self.current_active_process = self.current_active_process * 2
             ray.get(self.MPIRuntime.barrier.remote(self.rank))
             self.local_r_list[self.current_level-1] = self.residue(temp_u,self.local_r_list[self.current_level-1],a,self.current_level-1)
             ray.get(self.MPIRuntime.barrier.remote(self.rank))
             self.psinv(self.local_r_list[self.current_level-1],temp_u,c,self.current_level-1)
             ray.get(self.MPIRuntime.barrier.remote(self.rank))
             self.current_level -= 1
+
         if self.rank % (2 ** self.current_level) == 0:
             fine_process_step = 1
             dest_rank=self.rank+fine_process_step
             ray.get(self.MPIRuntime.expand_rank.remote(dest_rank))
         ray.get(self.MPIRuntime.barrier.remote(self.rank))
         self.local_approximate_sol = self.interp(temp_u,1)
+        self.current_active_process = self.current_active_process * 2
         ray.get(self.MPIRuntime.barrier.remote(self.rank))
         self.local_r_list[0] = self.residue(self.local_approximate_sol,v,a,0)
         ray.get(self.MPIRuntime.barrier.remote(self.rank))
         self.psinv(self.local_r_list[0],self.local_approximate_sol,c,0)
         ray.get(self.MPIRuntime.barrier.remote(self.rank))
+        
         self.finish_down = False
         self.current_level -= 1
         return
 
     def get_r_norm(self,r):
-        r_norm = np.sum(r[1:-1,1:-1,1:-1]**2)**(0.5)
+        r_norm = np.sum(r[1:-1,1:-1,1:-1]**2)
         recv_data = ray.get(self.MPIRuntime.gather.remote(self.rank, r_norm, 0))
         if self.rank == 0:
             norm_sum = 0.0
             for data in recv_data:
                 norm_sum = norm_sum + data
+            norm_sum = norm_sum ** 0.5
             print(f"Process {self.rank}, Iteration Numner {self.current_iteration} :\n", norm_sum, flush = True)
     
     def update_state(self):
@@ -443,7 +580,8 @@ class mg_actor:
         self.state["finish_down"] = self.finish_down
         self.state["current_level"] = self.current_level
         self.state["local_z"] = self.local_z
-        self.state["pre_set"] = self.pre_set
+        self.state["local_layer"] = self.local_layer
+        self.state["current_active_process"] = self.current_active_process
     
     def update_actor_from_state(self):
         self.world_size = self.state["world_size"]
@@ -460,7 +598,8 @@ class mg_actor:
         self.finish_down = self.state["finish_down"]
         self.current_level = self.state["current_level"]
         self.local_z = self.state["local_z"]
-        self.pre_set = self.state["pre_set"]
+        self.current_active_process = self.state["current_active_process"]
+        self.local_layer = self.state["local_layer"]
 
     def shrink_rank(self):
         self.update_state()
@@ -472,7 +611,7 @@ class mg_actor:
         should_reconfig = ray.get(self.MPIRuntime.reconfigure_test.remote(self.rank))
         if not should_reconfig:
             return
-
+        
         ray.get(self.MPIRuntime.set_reconfig_start_time.remote(self.rank, time.time()))
         self.update_state()
         state_ref = ray.put(self.state, _owner=self.MPIRuntime)
@@ -500,7 +639,7 @@ class mg_actor:
             global_sol[i*(Nz-2):(i*(Nz-2)+Nz), :, :] = source_state["local_approximate_sol"]
         NNz = (global_z_range - 2) // M + 2
         return_val = [None] * M 
-        max_grid_level = int(math.log2(M))
+        max_grid_level = template_state["max_grid_level"]
         single_process_z_range = template_state["init_range"] * N // M
         for i in range(M):
             new_state = copy.deepcopy(template_state)
@@ -510,6 +649,7 @@ class mg_actor:
             new_state["world_size"] = M
             new_state["init_range"] = single_process_z_range
             new_state["max_grid_level"] = max_grid_level
+            new_state["current_active_process"] = M
             return_val[i] = ray.put(new_state)
         return return_val
 
@@ -593,7 +733,6 @@ class mg_actor:
                     ray.get(self.MPIRuntime.change_ranks.remote(self.rank, self.world_size*2))
                 else:
                     ray.get(self.MPIRuntime.change_ranks.remote(self.rank, self.world_size//2))
-            
             self.reconfigure_rank()
             self.current_iteration += 1 
 
@@ -672,7 +811,7 @@ def main():
     controller = Controller.options(name="Controller", lifetime="detached", get_if_exists=True).remote(world_size)
     RayMPIRuntime = ray_mpi.RayMPIRuntime.options(name="MPIRuntime", lifetime="detached", get_if_exists=True).remote()
     
-    enable_profile = True
+    enable_profile = False
     ray.get(RayMPIRuntime.init.remote(world_size, enable_profile))
     if enable_profile:
         ray.get(controller.setup_profile.remote())
