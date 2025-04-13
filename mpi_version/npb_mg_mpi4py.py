@@ -19,9 +19,12 @@ max_grid_level = 0
 local_approximate_sol = None
 local_z = None
 local_r_list = []
+current_active_process = 0
+local_layer = 0
+
 
 def setup():
-    global Nx, Ny, Nz, single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_approximate_sol, local_z, local_r_list
+    global Nx, Ny, Nz, single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_approximate_sol, local_z, local_r_list, current_active_process, local_layer
 
     setup_debug = False
 
@@ -43,7 +46,7 @@ def setup():
             comm.Abort(1)
 
         current_grid_level = 0
-        max_grid_level = int(math.log2(max_num_process))
+        max_grid_level = int(math.log2(grid_size))
     
     if curr_rank == 0:
         data = {"Nx": Nx, "Ny": Ny, "Nz": Nz, "single_process_z_range": single_process_z_range, "max_num_process": max_num_process, "current_grid_level" : current_grid_level, "max_grid_level" : max_grid_level}
@@ -55,9 +58,11 @@ def setup():
     max_num_process = data["max_num_process"]
     current_grid_level = data["current_grid_level"]
     max_grid_level = data["max_grid_level"]
+    current_active_process = max_num_process
     single_process_z_range = data["single_process_z_range"]
     local_approximate_sol = np.zeros((single_process_z_range, Ny, Nx))
     local_r_list = [None] * (max_grid_level + 1)
+    local_layer = 0
     if(curr_rank < max_num_process):
         process_activate_flag = True
     else:
@@ -66,6 +71,20 @@ def setup():
     if setup_debug:
         print(f"Process {curr_rank}: Nx={Nx}, Ny={Ny}, Nz={Nz}, single_process_z_range={single_process_z_range}, process_activate_flag={process_activate_flag}, max_num_process={max_num_process}, current_grid_level={current_grid_level}, max_grid_level={max_grid_level}")
 
+def local_comm3(data):
+    global single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_z
+
+    if process_activate_flag == False:
+        return
+
+    Nz, Ny, Nx = data.shape
+    data[1:(Nz-1), 1:(Ny-1), Nx - 1] = data[1:(Nz-1), 1:(Ny-1), 1]
+    data[1:(Nz-1), 1:(Ny-1), 0]      = data[1:(Nz-1), 1:(Ny-1), Nx - 2]
+    data[1:(Nz-1), Ny - 1, :] = data[1:(Nz-1), 1, :]
+    data[1:(Nz-1), 0, :] = data[1:(Nz-1), Ny - 2, :]
+    data[0, :, :] = data[-2, :, :]
+    data[-1, :, :] = data[1, :, :]
+
 def comm3(data, grid_level):
     ''' periodic boundary. Also send the boundary data to nearby process '''
     global single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_z
@@ -73,7 +92,6 @@ def comm3(data, grid_level):
     if process_activate_flag == False:
         return
     Nz, Ny, Nx = data.shape
-    # we always assume the data has shape Nx * Ny * (2 + single_process_z_range)
 
     # Exchange x-axis data
     data[1:(Nz-1), 1:(Ny-1), Nx - 1] = data[1:(Nz-1), 1:(Ny-1), 1]
@@ -152,20 +170,32 @@ def residue(u,v,a,grid_level):
     
     r = np.zeros_like(v)
     r[1:(Nz-1), 1:(Ny-1), 1:(Nx-1)] = v[1:(Nz-1), 1:(Ny-1), 1:(Nx-1)] - a[0] * u[1:(Nz-1), 1:(Ny-1), 1:(Nx-1)] - a[1] * ua1 - a[2] * ua2 - a[3] * ua3
-    '''
-    r = np.zeros_like(v)
-    for i3 in range(1,Nz-1):
-        for i2 in range(1,Ny-1):
-            u1 = np.zeros((Nx))
-            u2 = np.zeros((Nx))
-            for i1 in range(Nx):
-                u1[i1] = u[i3,i2-1,i1] + u[i3,i2+1,i1] + u[i3-1,i2,i1] + u[i3+1,i2,i1]
-                u2[i1] = u[i3-1,i2-1,i1] + u[i3-1,i2+1,i1] + u[i3+1,i2-1,i1] + u[i3+1,i2+1,i1]
-            for i1 in range(1,Nx-1):
-                r[i3,i2,i1] = v[i3,i2,i1] - a[0] * u[i3,i2,i1] - a[2] * (u2[i1] + u1[i1-1] + u1[i1+1]) - a[3] * (u2[i1-1] + u2[i1+1])
-    '''
-    comm3(r,grid_level)
+    
+    if 2**grid_level < comm.Get_size():
+        comm3(r,grid_level)
+    else:
+        local_comm3(r)
     return r 
+
+def local_residue(u,v,a):
+    global single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_z
+
+    if process_activate_flag == False:
+        return None
+    
+    Nz, Ny, Nx = v.shape
+
+    u1 = u[1:(Nz-1), 0:(Ny-2), :] + u[1:(Nz-1), 2:Ny, :] + u[0:(Nz-2), 1:(Ny-1), :] + u[2:Nz, 1:(Ny-1), :]
+    u2 = u[0:(Nz-2), 0:(Ny-2), :] + u[0:(Nz-2), 2:Ny, :] + u[2:Nz, 0:(Ny-2), :] +u[2:Nz, 2:Ny, :]
+    ua1 = u[1:(Nz-1), 1:(Ny-1), 0:(Nx-2)] + u[1:(Nz-1), 1:(Ny-1), 2:Nx] + u1[:, :, 1:(Nx-1)]
+    ua2 = u2[:,:,1:(Nx-1)] + u1[:, :, 0:(Nx-2)] + u1[:, :, 2:Nx]
+    ua3 = u2[:,:,0:(Nx-2)] + u2[:,:,2:Nx]
+
+    r = np.zeros_like(v)
+    r[1:(Nz-1), 1:(Ny-1), 1:(Nx-1)] = v[1:(Nz-1), 1:(Ny-1), 1:(Nx-1)] - a[0] * u[1:(Nz-1), 1:(Ny-1), 1:(Nx-1)] - a[1] * ua1 - a[2] * ua2 - a[3] * ua3
+
+    local_comm3(r)
+    return r
 
 def rprj3(r, grid_level):
     ''' 
@@ -223,6 +253,42 @@ def rprj3(r, grid_level):
         process_activate_flag = False
         return None
 
+def local_rprj3(r):
+    global single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_z
+
+    if process_activate_flag == False:
+        return None
+
+    Nz, Ny, Nx = r.shape
+    NNz = Nz // 2 + 1
+    NNy = Ny // 2 + 1
+    NNx = Nx // 2 + 1
+
+    s = np.zeros((NNz, NNy, NNx), dtype = r.dtype)
+
+    j3 = np.arange(1, NNz-1)
+    j2 = np.arange(1, NNy-1)
+    j1 = np.arange(1, NNx) # special here
+    j0 = np.arange(1, NNx-1)
+    i3 = 2 * j3 - 1
+    i2 = 2 * j2 - 1
+    i1 = 2 * j1 - 1
+    i0 = 2 * j0 - 1
+
+    ii0 = np.arange(Nx)
+    x1 = r[np.ix_(i3+1, i2, ii0)] + r[np.ix_(i3+1,i2+2,ii0)] + r[np.ix_(i3,i2+1,ii0)] + r[np.ix_(i3+2,i2+1,ii0)]
+    y1 = r[np.ix_(i3, i2, ii0)] + r[np.ix_(i3+2,i2,ii0)] + r[np.ix_(i3,i2+2,ii0)] + r[np.ix_(i3+2,i2+2,ii0)]
+    y2 = r[np.ix_(i3, i2, i0+1)] + r[np.ix_(i3+2,i2,i0+1)] + r[np.ix_(i3,i2+2,i0+1)] + r[np.ix_(i3+2,i2+2,i0+1)]
+    x2 = r[np.ix_(i3+1, i2, i0+1)] + r[np.ix_(i3+1,i2+2,i0+1)] + r[np.ix_(i3,i2+1,i0+1)] + r[np.ix_(i3+2,i2+1,i0+1)]
+    t2 = r[np.ix_(i3+1, i2+1, i0)] + r[np.ix_(i3+1, i2+1, i0+2)] + x2
+    t3 = x1[:,:,i0] + x1[:,:,i0+2] + y2
+    t4 = y1[:,:,i0] + y1[:,:,i0+2]
+
+    s[1:-1, 1:-1, 1:-1] = 0.5 * (r[np.ix_(i3+1, i2+1, i0+1)]) + 0.25 * t2 + 0.125 * t3 + 0.0625 * t4
+
+    local_comm3(s)
+    return s
+
 def interp(z,grid_level):
     ''' interpolate the grid value from coarse grid to fine grid. The function should activate some sleeping process '''
     global single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_approximate_sol, local_z
@@ -276,6 +342,33 @@ def interp(z,grid_level):
         else:
             return None
 
+def local_interp(z):
+    global single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_approximate_sol, local_z
+    
+    if process_activate_flag == False:
+        return None
+
+    Nz, Ny, Nx = z.shape
+    u = np.zeros((2*Nz-2, 2*Ny-2,2*Nx-2))
+
+    z1 = z[0:(Nz-1), 1:Ny, :] +  z[0:(Nz-1), 0:(Ny-1), :]
+    z2 = z[1:Nz, 0:(Ny-1), :] +  z[0:(Nz-1), 0:(Ny-1), :]
+    z3 = z[1:Nz, 1:Ny, :] + z[1:Nz, 0:(Ny-1), :] + z1
+
+    i3 = np.arange(0,Nz-1)
+    i2 = np.arange(0,Ny-1)
+    i1 = np.arange(0,Nx-1)
+    u[np.ix_(2*i3, 2*i2, 2*i1)] = u[np.ix_(2*i3, 2*i2, 2*i1)] + z[np.ix_(i3, i2, i1)]
+    u[np.ix_(2*i3, 2*i2, 2*i1+1)] = u[np.ix_(2*i3, 2*i2, 2*i1+1)] + 0.5*(z[np.ix_(i3, i2, i1+1)] + z[np.ix_(i3, i2, i1)])
+    u[np.ix_(2*i3, 2*i2+1, 2*i1)] = u[np.ix_(2*i3, 2*i2+1, 2*i1)] + 0.5 * z1[:,:,0:(Nx-1)]
+    u[np.ix_(2*i3, 2*i2+1, 2*i1+1)] = u[np.ix_(2*i3, 2*i2+1, 2*i1+1)] + 0.25 * (z1[:,:,0:(Nx-1)] + z1[:,:,1:Nx])
+    u[np.ix_(2*i3+1, 2*i2, 2*i1)] = u[np.ix_(2*i3+1, 2*i2, 2*i1)] + 0.5 * z2[:,:,0:(Nx-1)]
+    u[np.ix_(2*i3+1, 2*i2, 2*i1+1)] = u[np.ix_(2*i3+1, 2*i2, 2*i1+1)] + 0.25 * (z2[:,:,0:(Nx-1)] + z2[:,:,1:Nx])
+    u[np.ix_(2*i3+1, 2*i2+1, 2*i1)] = u[np.ix_(2*i3+1, 2*i2+1, 2*i1)] + 0.25 * z3[:,:,0:(Nx-1)]
+    u[np.ix_(2*i3+1, 2*i2+1, 2*i1+1)] = u[np.ix_(2*i3+1, 2*i2+1, 2*i1+1)] + 0.125*(z3[:,:,0:(Nx-1)] + z3[:,:,1:Nx])
+
+    return u
+
 def psinv(r, u, c, grid_level):
     ''' apply smoother to the data'''
     global single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_approximate_sol, local_z
@@ -294,6 +387,22 @@ def psinv(r, u, c, grid_level):
     comm3(u,grid_level)
     
     return
+
+def local_psinv(r, u, c):
+    global single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_approximate_sol, local_z
+    if process_activate_flag == False:
+        return
+
+    Nz, Ny, Nx = r.shape
+
+    r1 = r[1:(Nz-1),0:(Ny-2),:] + r[1:(Nz-1),2:Ny,:] + r[0:(Nz-2),1:(Ny-1),:] + r[2:Nz,1:(Ny-1),:]
+    r2 = r[0:(Nz-2),0:(Ny-2),:] + r[0:(Nz-2),2:Ny,:] + r[2:Nz,0:(Ny-2),:] + r[2:Nz,2:Ny,:]
+    c1 = r[1:(Nz-1),1:(Ny-1),0:(Nx-2)] + r[1:(Nz-1),1:(Ny-1),2:Nx] + r1[:,:,1:(Nx-1)]
+    c2 = r2[:,:,1:(Nx-1)] + r1[:,:,0:(Nx-2)] + r1[:,:,2:Nx]
+    c3 = r2[:,:,0:(Nx-2)] + r2[:,:,2:Nx]
+    u[1:(Nz-1),1:(Ny-1),1:(Nx-1)] = u[1:(Nz-1),1:(Ny-1),1:(Nx-1)] + c[0] * r[1:(Nz-1),1:(Ny-1),1:(Nx-1)] + c[1] * c1 + c[2] * c2 + c[3] * c3
+    
+    local_comm3(u)
 
 def randlc(x,a):
     r23 = 2.0 ** -23
@@ -422,84 +531,52 @@ def zran3(z, grid_level, x_seed, a):
 
 def mg3P(v,a,c):
     ''' implement the v-cycle multigrid algorithm '''
-
-    global single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_approximate_sol, local_z, local_r_list
-
+    global single_process_z_range, max_num_process, current_grid_level, max_grid_level, process_activate_flag, local_approximate_sol, local_z, local_r_list, current_active_process, local_layer
     rank = comm.Get_rank()
+
     for i in range(max_grid_level-1):
-        local_r_list[i+1] = rprj3(local_r_list[i],i)
+        if current_active_process > 1:
+            local_r_list[i+1] = rprj3(local_r_list[i],i)
+            current_active_process = current_active_process // 2
+        else:
+            local_layer += 1
+            local_r_list[i+1] = local_rprj3(local_r_list[i])
         comm.barrier()
     
     temp_u = np.zeros_like(local_r_list[max_grid_level-1])
-    psinv(local_r_list[max_grid_level-1],temp_u,c,max_grid_level-1)
+    if current_active_process > 1:
+        psinv(local_r_list[max_grid_level-1],temp_u,c,max_grid_level-1)
+    else:
+        local_psinv(local_r_list[max_grid_level-1], temp_u, c)
     comm.barrier()
     
-    for i in range(max_grid_level-1, 1, -1):
+    i = max_grid_level-1
+    while local_layer > 0:
+        temp_u = local_interp(temp_u)
+        local_r_list[i-1] = local_residue(temp_u, local_r_list[i-1], a)
+        local_psinv(local_r_list[i-1],temp_u,c)
+        i -= 1
+        local_layer -= 1
+    while i > 1:
         temp_u = interp(temp_u, i)
+        current_active_process = current_active_process * 2
         comm.barrier()
         local_r_list[i-1] = residue(temp_u,local_r_list[i-1],a,i-1)
         comm.barrier()
         psinv(local_r_list[i-1],temp_u,c,i-1)
         comm.barrier()
+        i -= 1
 
     local_approximate_sol = interp(temp_u,1)
+    current_active_process = current_active_process * 2
+
     comm.barrier()
     local_r_list[0] = residue(local_approximate_sol,v,a,0)
     comm.barrier()
     psinv(local_r_list[0],local_approximate_sol,c,0)
     comm.barrier()
-    # if process_activate_flag == True:
-    #     print(f"Rank {rank}")
-    #     print(local_approximate_sol[1,:,:])
     
     return
-
-''' test part '''
-def test_comm3(data_z, data_y, data_x, grid_level):
-    """
-    Creates a 3D numpy array with shape (data_z, data_y, data_x).
-    Each element is initialized with a unique value based on its indices for easy verification.
-    """
-    test_array = np.zeros((data_z, data_y, data_x), dtype=int)
-    rank = comm.Get_rank()
-    # Initialize array with values based on their indices for easy debugging
-    for z in range(data_z):
-        for y in range(data_y):
-            for x in range(data_x):
-                test_array[z, y, x] = (z + rank * 2**grid_level) * 10000 + y * 100 + x
-
-    print(f"Rank {rank}: Array Before comm3:")
-    print(test_array)
-
-    comm3(test_array, grid_level)
-
-    print(f"\nRank {rank}: Array After comm3:")
-    print(test_array)
-    
-def test_residue(data_z, data_y, data_x, grid_level):
-    test_array = np.zeros((data_z, data_y, data_x), dtype=float)
-    rank = comm.Get_rank()
-    # Initialize array with values based on their indices for easy debugging
-    for z in range(data_z):
-        for y in range(data_y):
-            for x in range(data_x):
-                test_array[z, y, x] = (z + rank * 2**grid_level) * 10000 + y * 100 + x
-
-    u = np.ones((data_z, data_y, data_x), dtype=float)
-    a = np.zeros((4), dtype=float)
-    
-    print(test_array.shape)
-    r = residue(u, test_array, a, grid_level)
-    print(r.shape)
-    
-def test_zran3(data_z, data_y, data_x, grid_level):
-    rank = comm.Get_rank()
-    z = np.zeros((data_z, data_y, data_x), dtype=np.float64)
-    x_seed = [314159265.0 + rank]
-    a = 5.0 ** 13
-
-    zran3(z, grid_level, x_seed, a)
-    print(f"Process {rank}:\n", z[1,:,:])
 
 def get_r_norm(r):
     rank = comm.Get_rank()
@@ -511,7 +588,6 @@ def get_r_norm(r):
             norm_sum = norm_sum + data
         print(f"Process {rank}:\n", norm_sum, flush = True)
 
-# debug part
 def sample_local_z(filename):
     global local_z
 

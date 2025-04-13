@@ -22,11 +22,6 @@ class SignalActor:
             self.ready_count = 0
             self.ready_event.clear()
     
-    # def release(self):
-    #     self.ready_event.set()
-    #     self.ready_count = 0
-    #     self.ready_event.clear()
-
     def clear(self):
         self.ready_count = 0
         self.ready_event.clear()
