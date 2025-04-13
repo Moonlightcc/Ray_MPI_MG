@@ -329,11 +329,14 @@ class RayMPIRuntime:
             return state_ref_l[0]
 
     # only used for in-loop change. The number of actor before and after iteration should be the same
-    async def shrink_rank(self, rank: int, state_ref_l):
+    async def shrink_rank(self, rank: int, state_ref_l, shrink_barrier = False, target_num = -1):
         
         self.rank_active[rank] = False
         self.world_size -= 1
         self.rank_states[rank] = state_ref_l[0]
+        ray.get(self.controller.delete_rank.remote(rank))
+        if shrink_barrier == True:
+            await self.collective_signals.wait(target_num)
     
     # only used for in-loop change.
     async def expand_rank(self, rank: int):
@@ -608,6 +611,12 @@ class RayMPIRuntime:
 
         await self.collective_signals.wait(self.world_size)
         return scattered_data
+   
+    async def get_world_size(self):
+        return self.world_size
+    
+    async def barrier_with_target_num(self, rank, target_num):
+        await self.collective_signals.wait(target_num)
 
     async def barrier(self, rank):
         """
@@ -618,5 +627,3 @@ class RayMPIRuntime:
 
         # Each process waits for all other processes to reach the barrier
         await self.collective_signals.wait(self.world_size)
-
-        # print(f"Rank {my_rank} has cross the barrier with {self.world_size} processes.")
