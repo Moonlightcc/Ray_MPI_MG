@@ -1,5 +1,6 @@
 import asyncio
 import ray
+import time
 from typing import List
 
 class SignalActor:
@@ -338,6 +339,18 @@ class RayMPIRuntime:
         if shrink_barrier == True:
             await self.collective_signals.wait(target_num)
     
+    async def get_time_recorder(self):
+        self.recorder = ray.get_actor("Recorder")
+
+    async def shrink_rank_with_record(self, rank: int, state_ref_l, current_iteration, shrink_barrier = False, target_num = -1):
+        self.rank_active[rank] = False
+        self.world_size -= 1
+        self.rank_states[rank] = state_ref_l[0]
+        ray.get(self.controller.delete_rank.remote(rank))
+        self.recorder.register_time.remote(rank, current_iteration, "delete_end", time.time())
+        if shrink_barrier == True:
+            await self.collective_signals.wait(target_num)
+
     # only used for in-loop change.
     async def expand_rank(self, rank: int):
         if self.rank_active[rank]:
@@ -616,7 +629,9 @@ class RayMPIRuntime:
         return self.world_size
     
     async def barrier_with_target_num(self, rank, target_num):
+        # print(f"{rank} call barrier_with_target_num with {target_num}")
         await self.collective_signals.wait(target_num)
+        # print(f"barrier_with_target_num release {rank}")
 
     async def barrier(self, rank):
         """
@@ -626,4 +641,6 @@ class RayMPIRuntime:
         # print(f"Rank {my_rank} is waiting at the barrier with {self.world_size} processes.")
 
         # Each process waits for all other processes to reach the barrier
+        # print(f"{rank} call barrier with {self.world_size}")
         await self.collective_signals.wait(self.world_size)
+        # print(f"barrier release {rank}")

@@ -6,6 +6,7 @@ import math
 import time
 import copy
 import asyncio
+import matplotlib.pyplot as plt
 
 ray.init(address="auto", namespace="default")
 @ray.remote
@@ -29,6 +30,9 @@ class mg_actor:
         self.current_iteration = self.state["citn"]
         self.is_initialized = self.state["init"]
         self.rank = rank
+
+        # for experiment
+        self.recorder = ray.get_actor("Recorder")
     
     def recover_from_state(self):
         self.max_grid_level = self.state["max_grid_level"]
@@ -498,14 +502,17 @@ class mg_actor:
                     self.local_layer += 1
                     self.local_r_list[self.current_level+1] = self.local_rprj3(self.local_r_list[self.current_level])
                 self.current_level += 1
+                ray.get(self.MPIRuntime.barrier.remote(self.rank))
+                '''
                 if self.local_layer == 0:
                     ray.get(self.MPIRuntime.barrier_with_target_num.remote(self.rank, self.current_active_process * 2))
                     if self.process_activate_flag == False:
                         self.finish_down = True
                         self.shrink_rank(self.current_active_process * 2)
+                        print(f"{rank} you should never see this !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!") 
                     else:
                         ray.get(self.MPIRuntime.barrier_with_target_num.remote(self.rank, self.current_active_process * 2))
-
+                '''
         max_grid_step = 2 ** (self.max_grid_level-1)
         temp_u = np.zeros_like(self.local_r_list[self.max_grid_level-1])
         if self.current_active_process > 1:
@@ -524,13 +531,14 @@ class mg_actor:
                 self.local_psinv(self.local_r_list[self.current_level-1],temp_u,c)
                 self.current_level -= 1
                 self.local_layer -= 1
-        
         while self.current_level > 1:
             ## need to activate the dead actors
+            '''
             if self.rank % (2 ** self.current_level) == 0:
                 fine_process_step = (2 ** (self.current_level-1))        
                 dest_rank=self.rank+fine_process_step
                 ray.get(self.MPIRuntime.expand_rank.remote(dest_rank))
+            '''
             ray.get(self.MPIRuntime.barrier.remote(self.rank))
             temp_u = self.interp(temp_u, self.current_level)
             self.current_active_process = self.current_active_process * 2
@@ -540,7 +548,6 @@ class mg_actor:
             self.psinv(self.local_r_list[self.current_level-1],temp_u,c,self.current_level-1)
             ray.get(self.MPIRuntime.barrier.remote(self.rank))
             self.current_level -= 1
-
         if self.rank % (2 ** self.current_level) == 0:
             fine_process_step = 1
             dest_rank=self.rank+fine_process_step
@@ -553,7 +560,6 @@ class mg_actor:
         ray.get(self.MPIRuntime.barrier.remote(self.rank))
         self.psinv(self.local_r_list[0],self.local_approximate_sol,c,0)
         ray.get(self.MPIRuntime.barrier.remote(self.rank))
-        
         self.finish_down = False
         self.current_level -= 1
         return
@@ -612,6 +618,10 @@ class mg_actor:
         if not should_reconfig:
             return
         
+        if self.rank == 0:
+            target_rank = ray.get(self.MPIRuntime.get_target_num.remote())
+            self.reconfig_iteration[self.current_iteration] = (self.world_size, target_rank)
+
         ray.get(self.MPIRuntime.set_reconfig_start_time.remote(self.rank, time.time()))
         self.update_state()
         state_ref = ray.put(self.state, _owner=self.MPIRuntime)
@@ -652,6 +662,47 @@ class mg_actor:
             new_state["current_active_process"] = M
             return_val[i] = ray.put(new_state)
         return return_val
+    
+    def compute_throughput(self, iteration_completion_times, window_size=50):
+        sorted_iters = sorted(iteration_completion_times.items())
+        iters = [item[0] for item in sorted_iters]
+        durations = [item[1] for item in sorted_iters]
+
+        cumulative_times = []
+        total_time = 0
+        for dur in durations:
+            total_time += dur
+            cumulative_times.append(total_time)
+
+        throughput = []
+        centers = []
+        for i in range(len(iters) - window_size):
+            start_time = cumulative_times[i]
+            end_time = cumulative_times[i + window_size]
+            duration = end_time - start_time
+            if duration > 0:
+                throughput.append(window_size / duration)
+            else:
+                throughput.append(0)
+            centers.append(iters[i + window_size // 2])
+        return centers, throughput
+    
+    def plot_throughput(self, centers, throughput, filename="throughput_plot.png"):
+
+        plt.figure(figsize=(10, 6))
+        plt.plot(centers, throughput, 'b.-', label='Throughput')
+        for iter_idx, (a, b) in self.reconfig_iteration.items():
+            plt.axvline(x=iter_idx, color='red', linestyle='--', alpha=0.6)
+            plt.text(iter_idx, max(throughput) * 0.95, f"{a}→{b}", rotation=90,
+                    verticalalignment='top', horizontalalignment='center', fontsize=9, color='red')
+        plt.xlabel('Iteration Number')
+        plt.ylabel('Throughput (Iterations/s)')
+        plt.title('Iteration Throughput Over Time with Actor Reconfigurations')
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(filename, dpi=300)
+        plt.close()
+        print(f"image saved: {filename}")
 
     def main(self):
         if self.is_initialized == False:
@@ -715,26 +766,40 @@ class mg_actor:
         # assume iteration_number is multiple of 5 for test
         phase_length = self.iteration_number // 5
         ray.get(self.MPIRuntime.set_init_end_time.remote(self.rank, time.time()))
+
+        if self.rank == 0:
+            self.iteration_time = {}
+            self.reconfig_iteration = {}
+            ray.get(self.MPIRuntime.set_threshold.remote(1000000))
+
         while self.current_iteration < self.iteration_number:
+            if self.rank == 0:
+                start_time = time.time()
             is_reborn = ray.get(self.MPIRuntime.is_reborn.remote(self.rank))
             if is_reborn == False:
                 # computation part
-                ray.get(self.MPIRuntime.set_computation_start_time.remote(self.rank, time.time()))
                 self.mg3P(self.local_z,a,c)
                 ray.get(self.MPIRuntime.barrier.remote(self.rank))
                 self.local_r_list[0] = self.residue(self.local_approximate_sol, self.local_z, a, 0)
-                ray.get(self.MPIRuntime.barrier.remote(self.rank))
+                # ray.get(self.MPIRuntime.barrier.remote(self.rank))
                 self.get_r_norm(self.local_r_list[0])
-                ray.get(self.MPIRuntime.barrier.remote(self.rank))
-                ray.get(self.MPIRuntime.set_computation_end_time.remote(self.rank, time.time()))
+                # ray.get(self.MPIRuntime.barrier.remote(self.rank))
 
-            if self.current_iteration % phase_length == 0:
+            if False and self.current_iteration != 0 and self.current_iteration % phase_length == 0:
                 if self.current_iteration < self.iteration_number // 2:
                     ray.get(self.MPIRuntime.change_ranks.remote(self.rank, self.world_size*2))
                 else:
                     ray.get(self.MPIRuntime.change_ranks.remote(self.rank, self.world_size//2))
             self.reconfigure_rank()
             self.current_iteration += 1 
+            if self.rank == 0:
+                end_time = time.time()
+                self.iteration_time[self.current_iteration] = end_time - start_time
+
+        if self.rank == 0:
+            print(self.reconfig_iteration)
+            centers, throughput = self.compute_throughput(self.iteration_time, window_size=2)
+            self.plot_throughput(centers, throughput, filename="my_throughput.png")
 
 
 @ray.remote
@@ -758,7 +823,7 @@ class Controller:
             print("Rank {} already exists".format(rank))
             return 
 
-        rank_handle = mg_actor.options(name="rank-{}".format(rank), lifetime="detached", get_if_exists=True).remote(rank, state_ref_l)
+        rank_handle = mg_actor.options(name="mg-actor-rank-{}".format(rank), lifetime="detached", get_if_exists=True).remote(rank, state_ref_l)
         self.ranks_handle[rank] = rank_handle
 
         asyncio.create_task(self._run_rank(rank))
@@ -789,8 +854,8 @@ class Controller:
             return
 
     async def delete_rank(self, rank):
-         ray.kill(self.ranks_handle[rank], no_restart=True)
-         while True:
+        ray.kill(self.ranks_handle[rank], no_restart=True)
+        while True:
             try:
                 await self.ranks_handle[rank].ping.remote()
             except ray.exceptions.RayActorError:
